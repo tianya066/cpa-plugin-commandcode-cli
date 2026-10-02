@@ -1,0 +1,16 @@
+cpa-plugin-commandcode-cli
+==========================
+
+This project is a fork of cpa-plugin-commandcode by ahoo:
+  https://github.com/ahoo/cpa-plugin-commandcode
+  Copyright (c) 2026 ahoo
+  Licensed under the MIT License (see LICENSE).
+
+Modifications in this fork (v0.4.0):
+  - cli.go            : CLI transport (new)
+  - config.go         : transport / cli_base_url / cli_version / cli_working_dir (new keys)
+  - executor.go       : CLI execution paths and the `auto` fallback
+  - cli_local_test.go : unit tests for the CLI transport (new)
+  - cmd/liveprobe/    : live upstream probe (new)
+
+All other files are unchanged upstream code.
