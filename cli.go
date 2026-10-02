@@ -142,17 +142,79 @@ func (e *Executor) cliEndpoint() string {
 	return e.cfg.cliBaseURL() + cliGeneratePath
 }
 
-// cliHeaders builds the CLI request headers. The version header is part of the
-// route's documented client contract: without it the service refuses the call
-// with upgrade_required.
+// cliHeaders builds the CLI request headers, mirroring the header set the
+// reference implementation (Mars-Sea/dsh-commandcode-provider, src/adapter.ts
+// "cli" protocol branch) sends on this route:
+//
+//	Content-Type / Authorization / Accept      transport basics
+//	accept-encoding: identity                  plain bodies, no undecoded gzip
+//	user-agent                                 honest self-identification
+//	x-command-code-version                     the route's compatibility gate
+//	x-cli-environment: production              CLI environment discriminator
+//	x-project-slug                             slug of the working directory
+//	x-taste-learning: false                    CLI feature flags
+//	x-co-flag: false
+//
+// The version header is the route's own client contract: without it the service
+// refuses the call with `403 upgrade_required` (minVersion 0.18.10).
 func (e *Executor) cliHeaders(apiKey string) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	h.Set("Authorization", "Bearer "+apiKey)
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", "cli-proxy-commandcode")
+	h.Set("accept-encoding", "identity")
+	h.Set("User-Agent", e.cfg.cliUserAgent())
 	h.Set("x-command-code-version", e.cfg.cliVersion())
+	h.Set("x-cli-environment", "production")
+	h.Set("x-project-slug", projectSlug(e.cfg.cliWorkingDir()))
+	h.Set("x-taste-learning", "false")
+	h.Set("x-co-flag", "false")
 	return h
+}
+
+// cliUserAgent is the identity this plugin sends upstream. It is a truthful
+// self-identification ("product/version (+url)"), not a copy of the official
+// CLI's user agent: the CLI route gates on x-command-code-version, while the UA
+// tells the service which client is actually calling.
+func (c *pluginConfig) cliUserAgent() string {
+	if c != nil {
+		if ua := strings.TrimSpace(c.CLIUserAgent); ua != "" {
+			return ua
+		}
+	}
+	return "cli-proxy-commandcode/" + pluginVersion + " (+https://github.com/ahoo/cpa-plugin-commandcode)"
+}
+
+// projectSlug renders a working directory the way the reference implementation
+// does (projectSlugFromPath): lower-case, non-alphanumerics collapsed to single
+// dashes, drive prefix dropped, leading/trailing dashes trimmed.
+func projectSlug(pathName string) string {
+	trimmed := strings.TrimSpace(pathName)
+	if trimmed == "" {
+		return "project"
+	}
+	lowered := strings.ToLower(trimmed)
+	if len(lowered) >= 2 && lowered[1] == ':' {
+		lowered = lowered[2:]
+	}
+	var b strings.Builder
+	lastDash := false
+	for _, r := range lowered {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		return "project"
+	}
+	return slug
 }
 
 // buildCLIBody converts the OpenAI chat-completions payload into the CLI

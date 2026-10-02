@@ -142,3 +142,29 @@ Against a live Go-plan account (2026-10-03):
 ## License
 
 MIT — see `LICENSE` (upstream copyright retained) and `NOTICE`.
+## Header set sent on the CLI route
+
+Mirrors the reference implementation
+([Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider),
+`src/adapter.ts` — the `cli` protocol branch):
+
+| Header | Value | Why |
+|---|---|---|
+| `Content-Type` | `application/json` | transport |
+| `Authorization` | `Bearer <key>` | auth |
+| `Accept` | `text/event-stream` | the route streams only |
+| `accept-encoding` | `identity` | ask for plain bodies, so compressed SSE/pre-stream errors cannot arrive undecoded |
+| `x-command-code-version` | `1.73.0` (configurable) | the route's compatibility gate; absent → `403 upgrade_required` |
+| `x-cli-environment` | `production` | CLI environment discriminator |
+| `x-project-slug` | slug of `cli_working_dir` | project identifier |
+| `x-taste-learning` | `false` | CLI feature flag |
+| `x-co-flag` | `false` | CLI feature flag |
+| `User-Agent` | `cli-proxy-commandcode/<ver> (+repo)` | truthful self-identification of the calling application |
+
+The `User-Agent` is deliberately **not** a copy of the official CLI's: the reference
+implementation sends its own product identity (`<product>/<version> (+url)`) rather than
+impersonating the vendor's client, and this fork follows that policy. Override it with
+`cli_user_agent:` if your deployment needs a different identity.
+
+`projectSlug` follows the reference implementation's `projectSlugFromPath`: lower-cased,
+non-alphanumerics collapsed to single dashes, drive prefix dropped, edges trimmed.
