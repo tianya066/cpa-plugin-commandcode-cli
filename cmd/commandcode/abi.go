@@ -94,6 +94,42 @@ type abiCapabilities struct {
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	RequestTranslator     bool                         `json:"request_translator"`
 	ResponseTranslator    bool                         `json:"response_translator"`
+	// ManagementAPI declares plugin-owned Management API + resource routes. The
+	// host only calls management.register / management.handle when this is set.
+	ManagementAPI bool `json:"management_api"`
+}
+
+// abiManagementRequest is the payload of management.handle.
+type abiManagementRequest struct {
+	pluginapi.ManagementRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// abiManagementResponse mirrors pluginapi.ManagementResponse on the wire.
+type abiManagementResponse struct {
+	StatusCode int         `json:"status_code,omitempty"`
+	Headers    http.Header `json:"headers,omitempty"`
+	Body       []byte      `json:"body,omitempty"`
+}
+
+// abiManagementRegistrationResponse mirrors ManagementRegistrationResponse,
+// carrying routes as JSON so the host can rehydrate their handlers.
+type abiManagementRegistrationResponse struct {
+	Routes    []abiManagementRoute    `json:"routes,omitempty"`
+	Resources []abiManagementResource `json:"resources,omitempty"`
+}
+
+type abiManagementRoute struct {
+	Method      string `json:"method,omitempty"`
+	Path        string `json:"path,omitempty"`
+	Menu        string `json:"menu,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type abiManagementResource struct {
+	Path        string `json:"path,omitempty"`
+	Menu        string `json:"menu,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type abiIdentifierResponse struct {
@@ -257,6 +293,10 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		}
 		resp, errCall := p.TranslateResponse(ctx, req)
 		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodManagementRegister:
+		return buildManagementRegistration(ctx)
+	case pluginabi.MethodManagementHandle:
+		return handleManagementRequest(ctx, request)
 	case pluginabi.MethodExecutorExecute:
 		var rpcReq abiExecutorRequest
 		if errDecode := json.Unmarshal(request, &rpcReq); errDecode != nil {
@@ -330,8 +370,60 @@ func handleRegister(request []byte) ([]byte, error) {
 			ExecutorOutputFormats: append([]string(nil), built.Capabilities.ExecutorOutputFormats...),
 			RequestTranslator:     built.Capabilities.RequestTranslator != nil,
 			ResponseTranslator:    built.Capabilities.ResponseTranslator != nil,
+			ManagementAPI:         built.Capabilities.ManagementAPI != nil,
 		},
 	})
+}
+
+// buildManagementRegistration answers management.register.
+func buildManagementRegistration(ctx context.Context) ([]byte, error) {
+	p, err := currentPlugin()
+	if err != nil {
+		return abiErrorEnvelope("not_registered", err.Error()), nil
+	}
+	reg, err := p.RegisterManagement(ctx, pluginapi.ManagementRegistrationRequest{})
+	if err != nil {
+		return abiErrorEnvelope("management_register_failed", err.Error()), nil
+	}
+	out := abiManagementRegistrationResponse{}
+	for _, route := range reg.Routes {
+		out.Routes = append(out.Routes, abiManagementRoute{
+			Method: route.Method, Path: route.Path, Menu: route.Menu, Description: route.Description,
+		})
+	}
+	for _, res := range reg.Resources {
+		out.Resources = append(out.Resources, abiManagementResource{
+			Path: res.Path, Menu: res.Menu, Description: res.Description,
+		})
+	}
+	return abiOKEnvelope(out)
+}
+
+// handleManagementRequest answers management.handle.
+func handleManagementRequest(ctx context.Context, request []byte) ([]byte, error) {
+	p, err := currentPlugin()
+	if err != nil {
+		return abiErrorEnvelope("not_registered", err.Error()), nil
+	}
+	var payload abiManagementRequest
+	if len(request) > 0 {
+		_ = json.Unmarshal(request, &payload)
+	}
+	resp, err := p.HandleManagement(ctx, pluginapi.ManagementRequest{
+		Method:  payload.Method,
+		Path:    payload.Path,
+		Headers: payload.Headers,
+		Query:   payload.Query,
+		Body:    payload.Body,
+	})
+	if err != nil {
+		return abiErrorEnvelope("management_failed", err.Error()), nil
+	}
+	status := resp.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return abiOKEnvelope(abiManagementResponse{StatusCode: status, Headers: resp.Headers, Body: resp.Body})
 }
 
 func currentPlugin() (*plug.CommandCodePlugin, error) {

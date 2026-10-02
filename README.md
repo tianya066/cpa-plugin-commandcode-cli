@@ -168,3 +168,34 @@ impersonating the vendor's client, and this fork follows that policy. Override i
 
 `projectSlug` follows the reference implementation's `projectSlugFromPath`: lower-cased,
 non-alphanumerics collapsed to single dashes, drive prefix dropped, edges trimmed.
+## Management panel
+
+The plugin contributes its own page to the CPA Management Center (menu entry
+**CommandCode**) plus seven editable config fields, so the panel shows the channel
+state instead of an empty plugin row.
+
+| Route | Purpose |
+|---|---|
+| `GET /v0/resource/plugins/commandcode/index.html` | the panel page (self-contained HTML, no build step) |
+| `GET /v0/management/commandcode/status` | JSON behind the page: transport, model map, key pool, account |
+
+The page renders:
+
+* **transport & endpoints** — `provider` / `cli` / `auto`, the provider base URL, and the
+  CLI base URL + version header when the CLI route is in use
+* **account** — email and subscription status from `/alpha/whoami` and
+  `/alpha/billing/subscriptions`
+* **plan quota** — monthly credits and the rolling 5-hour / weekly windows with used/cap,
+  progress bars and reset countdown, from `/alpha/billing/credits`
+* **key pool** — every configured credential with weight, proxy flag and disabled state
+  (values are masked; the panel never receives a full key)
+* **model map** — client alias → upstream name → `commandcode/...` namespace id
+
+Account reads reuse the host HTTP client captured from the last executor request, falling
+back to a plain client before any request has been seen; results are cached for 30 s so a
+page reload does not hammer the account endpoints.
+
+`transport`, `cli_version`, `cli_base_url`, `cli_working_dir`, `cli_user_agent`,
+`base_url` and `priority` are declared as `ConfigField`s, so the panel can render them.
+The CLI route still needs a restart after a config change (the host does not hot-reload
+plugin configuration).

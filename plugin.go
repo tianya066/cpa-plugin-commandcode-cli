@@ -67,6 +67,22 @@ func Build(configYAML []byte) (pluginapi.Plugin, *CommandCodePlugin) {
 			Version:          pluginVersion,
 			Author:           "cpa-admin",
 			GitHubRepository: "https://github.com/ahoo/cpa-plugin-commandcode",
+			ConfigFields: []pluginapi.ConfigField{
+				{Name: "transport", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"provider", "cli", "auto"},
+					Description: "上游通道：provider 走 /provider/v1（Provider 及以上套餐）；cli 走 /alpha/generate（Go/GOAT/Pro/Max 套餐的 CLI 通道）；auto 先试 provider，遇套餐拒绝自动改走 CLI。留空等于 provider。"},
+				{Name: "cli_version", Type: pluginapi.ConfigFieldTypeString,
+					Description: "CLI 通道发送的 x-command-code-version（默认 1.73.0）。该通道以此头做兼容门禁，缺失会返回 403 upgrade_required。"},
+				{Name: "cli_base_url", Type: pluginapi.ConfigFieldTypeString,
+					Description: "CLI 通道根地址（默认 https://api.commandcode.ai）。留空时由 base_url 去掉 /provider/v1 推导。"},
+				{Name: "cli_working_dir", Type: pluginapi.ConfigFieldTypeString,
+					Description: "CLI 请求信封里的 config.workingDir，同时用于生成 x-project-slug（默认 /tmp）。"},
+				{Name: "cli_user_agent", Type: pluginapi.ConfigFieldTypeString,
+					Description: "CLI 通道的 User-Agent，默认是本插件的自标识 product/version (+url)。"},
+				{Name: "base_url", Type: pluginapi.ConfigFieldTypeString,
+					Description: "Provider API 根地址（默认 https://api.commandcode.ai/provider/v1）。"},
+				{Name: "priority", Type: pluginapi.ConfigFieldTypeInteger,
+					Description: "插件优先级；多个插件争夺同一模型时按此排序。"},
+			},
 		},
 		Capabilities: pluginapi.Capabilities{
 			ModelProvider:         p.models,
@@ -78,6 +94,7 @@ func Build(configYAML []byte) (pluginapi.Plugin, *CommandCodePlugin) {
 			RequestTranslator:     p.translator,
 			ResponseTranslator:    p.translator,
 			UsagePlugin:           p,
+			ManagementAPI:         p,
 		},
 	}
 	return desc, p
@@ -125,6 +142,17 @@ func (p *CommandCodePlugin) ExecuteStream(ctx context.Context, req pluginapi.Exe
 // CountTokens estimates tokens without calling upstream.
 func (p *CommandCodePlugin) CountTokens(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	return p.executor.CountTokens(ctx, req)
+}
+
+// RegisterManagement declares the plugin's Management API routes and its
+// browser-navigable panel page (see management.go).
+func (p *CommandCodePlugin) RegisterManagement(ctx context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
+	return p.registerManagementRoutes(ctx, req)
+}
+
+// HandleManagement serves the plugin's own management routes.
+func (p *CommandCodePlugin) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
+	return p.handleManagementRequest(ctx, req)
 }
 
 // HttpRequest bridges executor-owned raw HTTP through the host client.
