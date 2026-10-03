@@ -199,3 +199,19 @@ page reload does not hammer the account endpoints.
 `base_url` and `priority` are declared as `ConfigField`s, so the panel can render them.
 The CLI route still needs a restart after a config change (the host does not hot-reload
 plugin configuration).
+### Panel authentication
+
+The panel page is served from the plugin resource route (no auth on the document
+itself), while its data comes from `/v0/management/commandcode/status`, which the
+host protects with the management key. The page therefore reads the key the CPA
+panel itself stored:
+
+* `localStorage["managementKey"]`, which the panel writes XOR-obfuscated with
+  `"cli-proxy-api-webui::secure-storage|<host>|<userAgent>"` and prefixed with
+  `enc::v1::` (the page de-obfuscates the same way the panel does);
+* a plaintext value, if the entry was written by an older panel or by hand;
+* `?key=<management key>` on the page URL, as a fallback.
+
+So the page works as soon as you have signed in to the panel **in the same browser**
+(same origin ⇒ same localStorage). If it reports `HTTP 401`, sign in to the panel
+first, or append `?key=…` once.

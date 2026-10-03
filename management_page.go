@@ -97,8 +97,67 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
     return Math.round(mins / 60) + ' 小时后重置';
   }
 
-  fetch(BASE, { headers: { 'Accept': 'application/json' } })
-    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+  // The management API needs the same key the panel uses. The panel keeps it in
+  // localStorage under the "managementKey" entry, XOR-obfuscated with material
+  // derived from "cli-proxy-api-webui::secure-storage|<host>|<userAgent>"
+  // (see the panel's Tl/El/Sl/wl helpers) and prefixed with "enc::v1::".
+  // Same origin, so the value is readable here; a plaintext key (older panel or
+  // hand-written entry) is accepted as-is.
+  var OBFUSCATION_PREFIX = 'enc::v1::';
+  var OBFUSCATION_MATERIAL = 'cli-proxy-api-webui::secure-storage';
+
+  function deobfuscate(stored) {
+    if (!stored) return '';
+    if (stored.indexOf(OBFUSCATION_PREFIX) !== 0) return stored; // plaintext
+    try {
+      var material = new TextEncoder().encode(
+        OBFUSCATION_MATERIAL + '|' + window.location.host + '|' + navigator.userAgent);
+      var raw = atob(stored.slice(OBFUSCATION_PREFIX.length));
+      var bytes = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      var out = new Uint8Array(bytes.length);
+      for (var j = 0; j < bytes.length; j++) out[j] = bytes[j] ^ material[j % material.length];
+      var text = new TextDecoder().decode(out);
+      // The store JSON-encodes the value before obfuscating it.
+      if (text.charAt(0) === '"' || text.charAt(0) === '{') {
+        try {
+          var parsed = JSON.parse(text);
+          if (typeof parsed === 'string') return parsed;
+          if (parsed && typeof parsed.value === 'string') return parsed.value;
+        } catch (e) { /* keep the decoded text */ }
+      }
+      return text;
+    } catch (e) { return ''; }
+  }
+
+  function readManagementKey() {
+    var raw = '';
+    try { raw = window.localStorage.getItem('managementKey') || ''; } catch (e) { raw = ''; }
+    var key = deobfuscate(raw);
+    if (!key) {
+      try { key = deobfuscate(window.sessionStorage.getItem('managementKey') || ''); } catch (e) { key = ''; }
+    }
+    if (!key) {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        key = params.get('key') || params.get('managementKey') || '';
+      } catch (e) { /* ignore */ }
+    }
+    return key;
+  }
+
+  var mgmtKey = readManagementKey();
+  var headers = { 'Accept': 'application/json' };
+  if (mgmtKey) headers['Authorization'] = 'Bearer ' + mgmtKey;
+
+  fetch(BASE, { headers: headers })
+    .then(function (r) {
+      if (r.status === 401 || r.status === 403) {
+        throw new Error('HTTP ' + r.status + ' —— 未取到管理密钥。请先在 CPA 面板登录（本页依赖面板保存的 managementKey），或在此页地址后追加 ?key=你的管理密钥');
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
     .then(function (d) {
       document.getElementById('ver').textContent = 'v' + (d.version || '?');
       document.getElementById('at').textContent = d.generated_at ? ('采集于 ' + d.generated_at) : '';
