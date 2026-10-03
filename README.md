@@ -231,3 +231,19 @@ operator to the management credential input.
 
 现在编码统一走 `ManagementEnvelope`，并由
 `TestManagementEnvelopeRoundTripsThroughSDKType` 用 SDK 类型解码回归。
+
+### 管理响应转义与 usage 回调（0.7.2 修复）
+
+宿主对 `schema_version < 6` 的插件会把管理接口 JSON 里的每个字符串做 HTML 实体转义。
+本插件原先按 v7 SDK 的常量上报 4，导致 `/status` 里的上游错误文本变成 `&#34;` 之类，
+并且 `display_name`、`base_url` 这类用户可编辑字段每次读取都被转义、保存时又把转义
+结果写回，值会被逐次污染。现在上报 `abiSchemaVersion = 6`（宿主的
+`SchemaVersionRawManagementResponse`），管理响应按原文返回。
+
+同时补齐 `usage_plugin` 能力位：`plugin.go` 一直声明
+`pluginapi.Capabilities.UsagePlugin`，但 ABI 注册结构里没有对应字段、分发表里也没有
+`usage.handle`，所以宿主从不注册 usage 适配器，`HandleUsage` 永远不会被调用。现已
+导出该能力并补上分发分支。
+
+`cmd/commandcode/abi_contract_test.go` 覆盖这三项契约：状态码按 SDK 类型往返、
+注册上报 schema_version ≥ 6、已实现能力必须在线上导出且有分发分支。

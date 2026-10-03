@@ -5,7 +5,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="commandcode"
-PLUGIN_VERSION="${PLUGIN_VERSION:-0.7.1}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-0.7.2}"
 OUT_DIR="${PLUGIN_OUT_DIR:-${SRC_DIR}/../../plugins/linux/amd64}"
 GO_IMAGE="${PLUGIN_GO_IMAGE:-golang:1.26}"
 

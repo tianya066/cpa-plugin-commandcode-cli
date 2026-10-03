@@ -6,7 +6,7 @@
       "name": "CommandCode Provider",
       "description": "CommandCode CLI and Provider transports with a unified account and model management page, per-key quotas, weighted keys, proxies, live configuration and inference tests.",
       "author": "tianya066",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "repository": "https://github.com/tianya066/cpa-plugin-commandcode-cli",
       "homepage": "https://github.com/tianya066/cpa-plugin-commandcode-cli",
       "license": "MIT",

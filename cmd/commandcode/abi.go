@@ -1,9 +1,17 @@
 // CommandCode provider plugin ABI entrypoint (c-shared).
 //
 // Mirrors cmd/geminicli/abi.go from cpa-plugin-gemini-cli, trimmed to the
-// capabilities this plugin declares: model_provider, model_router,
-// executor, request/response translators. SchemaVersion tracks the host
-// contract (v7.2.147 => 4).
+// capabilities this plugin declares: model_provider, model_router, executor,
+// request/response translators, usage, management.
+//
+// schema_version is reported as 6 rather than the v7 SDK's constant (4). The
+// v8 host HTML-entity-escapes management JSON whenever schema_version < 6
+// (internal/pluginhost/management.go: managementResponseEscapesHTML), which
+// rewrites every string in the management responses: an upstream error body
+// renders mangled, and a user string containing & < > " ' is escaped on read
+// and escaped again on each save, permanently corrupting the stored value.
+// Version 5 (omit HistoryChunks on payload chunks) does not affect this plugin:
+// it declares no StreamChunkInterceptor. See abiSchemaVersion.
 package main
 
 /*
@@ -67,7 +75,17 @@ import (
 
 // pluginVersion is overridden at release build time. build.sh also injects
 // the library package's descriptor version with the same value.
-var pluginVersion = "0.7.1"
+var pluginVersion = "0.7.2"
+
+// abiSchemaVersion is the RPC contract version reported at plugin.register.
+//
+// It is pinned to 6 (raw management JSON) instead of the linked v7 SDK's
+// pluginabi.SchemaVersion (4) because this plugin serves a management page and
+// the v8 host escapes management JSON for schema_version < 6. The host only
+// rejects a version that is *higher* than its own
+// (internal/pluginhost/rpc_client.go: "plugin schema version %d is not
+// supported"), and 6 is current for the deployed v8.0.11 host.
+const abiSchemaVersion uint32 = 6
 
 var abiState = struct {
 	sync.RWMutex
@@ -94,6 +112,11 @@ type abiCapabilities struct {
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	RequestTranslator     bool                         `json:"request_translator"`
 	ResponseTranslator    bool                         `json:"response_translator"`
+	// UsagePlugin declares the usage.handle callback. plugin.go advertises
+	// pluginapi.Capabilities.UsagePlugin, but the host only registers a usage
+	// adapter when this wire flag is set (internal/pluginhost/rpc_client.go),
+	// so omitting it made usage.handle unreachable.
+	UsagePlugin bool `json:"usage_plugin"`
 	// ManagementAPI declares plugin-owned Management API + resource routes. The
 	// host only calls management.register / management.handle when this is set.
 	ManagementAPI bool `json:"management_api"`
@@ -334,6 +357,13 @@ func handleABIMethod(ctx context.Context, method string, request []byte) ([]byte
 		req.HTTPClient = abiHostHTTPClient{callbackID: rpcReq.HostCallbackID}
 		resp, errCall := p.HttpRequest(ctx, req)
 		return abiOKEnvelopeWithError(resp, errCall)
+	case pluginabi.MethodUsageHandle:
+		var record pluginapi.UsageRecord
+		if errDecode := json.Unmarshal(request, &record); errDecode != nil {
+			return nil, errDecode
+		}
+		p.HandleUsage(ctx, record)
+		return abiOKEnvelope(abiEmptyResponse{})
 	default:
 		return abiErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -353,7 +383,7 @@ func handleRegister(request []byte) ([]byte, error) {
 	abiState.plugin = p
 	abiState.Unlock()
 	return abiOKEnvelope(abiRegistration{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: abiSchemaVersion,
 		Metadata:      built.Metadata,
 		Capabilities: abiCapabilities{
 			ModelProvider:         built.Capabilities.ModelProvider != nil,
@@ -364,6 +394,7 @@ func handleRegister(request []byte) ([]byte, error) {
 			ExecutorOutputFormats: append([]string(nil), built.Capabilities.ExecutorOutputFormats...),
 			RequestTranslator:     built.Capabilities.RequestTranslator != nil,
 			ResponseTranslator:    built.Capabilities.ResponseTranslator != nil,
+			UsagePlugin:           built.Capabilities.UsagePlugin != nil,
 			ManagementAPI:         built.Capabilities.ManagementAPI != nil,
 		},
 	})
