@@ -248,6 +248,15 @@ func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest
 				return pluginapi.ExecutorResponse{}, chunk.Err
 			}
 		}
+		// The route reported a failure mid-stream (an error event, or a tool
+		// call it refused to assemble). Aggregating anyway would hand a
+		// non-streaming caller an empty completion that claims success.
+		if state.streamErr != nil {
+			return pluginapi.ExecutorResponse{}, statusError{
+				statusCode: http.StatusBadGateway,
+				msg:        state.streamErr.Error(),
+			}
+		}
 		fixed, _ := mapReasoningBody(state.aggregate())
 		return pluginapi.ExecutorResponse{Payload: fixed, Headers: headers}, nil
 	}

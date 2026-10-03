@@ -26,7 +26,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +55,16 @@ type cliStreamState struct {
 	usage     *openAIUsage
 	finish    string
 	roleSent  bool
+	// rejected holds refused tool calls in arrival order: they must never reach
+	// the client as callable, and they must never vanish silently either.
+	rejected []cliRejectedCall
+	// reported guards one rejected call from being reported twice; the route
+	// emits an invalid tool-call and then a tool-error for the same id.
+	reported map[string]bool
+	// streamErr keeps the first in-stream failure. A streaming client sees the
+	// error chunk itself; the aggregation path needs this because a bare
+	// chat.completion would otherwise answer with empty content and claim success.
+	streamErr error
 }
 
 type cliToolCall struct {
@@ -598,6 +607,13 @@ func (s *cliStreamState) convert(obj []byte) [][]byte {
 		s.reasoning.WriteString(text)
 		return [][]byte{s.chunk(map[string]any{"reasoning_content": text}, nil)}
 	case "tool-call":
+		if invalid, _ := ev["invalid"].(bool); invalid {
+			// The route could not assemble the call: `input` carries the model's
+			// raw, unparsable text. Forwarding it would tell the client to run a
+			// tool with arguments it cannot parse.
+			s.rejectCall(ev)
+			return nil
+		}
 		id := stringField(ev, "toolCallId")
 		if id == "" {
 			id = "call_" + uuidV4()[:12]
@@ -615,6 +631,8 @@ func (s *cliStreamState) convert(obj []byte) [][]byte {
 			}},
 		}
 		return [][]byte{s.chunk(delta, nil)}
+	case "tool-error":
+		return s.reportCallFailure(ev)
 	case "finish":
 		if reason := stringField(ev, "finishReason"); reason != "" {
 			s.finish = mapFinishReason(reason)
@@ -624,14 +642,14 @@ func (s *cliStreamState) convert(obj []byte) [][]byte {
 		}
 		return nil
 	case "error":
-		msg := stringField(ev, "message")
-		if msg == "" {
-			msg = stringField(ev, "error")
-		}
+		msg := cliErrorMessage(ev)
 		if msg == "" {
 			msg = "commandcode cli stream error"
 		}
-		return [][]byte{[]byte(`{"error":{"message":` + strconv.Quote(msg) + `,"type":"upstream_error"}}`)}
+		// The streaming client sees the chunk itself; the aggregation path needs
+		// the reason too, or it answers a non-streaming caller with empty content.
+		s.noteStreamErr(msg)
+		return [][]byte{errorChunk(msg)}
 	default:
 		// start / start-step / text-start / text-end / reasoning-start /
 		// reasoning-end / finish-step / provider-metadata / cache-write-tokens
@@ -697,9 +715,11 @@ func (s *cliStreamState) closeChunks() [][]byte {
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return nil
+		return s.flushRejected()
 	}
-	return [][]byte{raw}
+	// A refused tool call the route never explained is still reported, so no
+	// caller sees a successful-looking completion that hides it.
+	return append(s.flushRejected(), raw)
 }
 
 // aggregate builds the non-streaming chat.completion response from the state

@@ -330,3 +330,48 @@ assistant 用 `tool_calls` 字段声明调用也无效——上游的 zod 双报
 账号」跑 20 轮必须全部成功（若转移失效，靠随机顺序每轮都先选中正常账号的概率是
 (1/11)^20），以及「校验 400 只打一次上游」的反向断言。变异验证：换掉额度标记后，
 两轮用例立即失败，报错正是客户端看到的 `You have insufficient credits ...`。
+
+### 被拒绝的工具调用与非流式静默失败（0.7.6 修复）
+
+上游对「工具参数无法解析」用**两个事件**报告同一次失败（逐字抓取）：
+
+```json
+{"type":"tool-call","toolCallId":"call_00_KNu…","toolName":"Bash",
+ "input":"{\"command\"","invalid":true,
+ "error":{"name":"AI_InvalidToolInputError","cause":{"name":"AI_JSONParseError","cause":{},"text":"{\"command\""}}}
+{"type":"tool-error","toolCallId":"call_00_KNu…","toolName":"Bash",
+ "input":"{\"command\"",
+ "error":"Invalid input for tool Bash: JSON parsing failed: Text: {\"command\".\nError message: Expected ':' after property name in JSON at position 10 (line 1 column 11)"}
+```
+
+注意 `input` 在这里是**字符串**（模型产出的残缺 JSON），不是对象。旧实现把它当正常调用转发，
+同时 `tool-error` 被 `switch` 的 `default` 静默吞掉，客户端于是被告知「用 `{"command` 调用 Bash」：
+
+```
+流式   tool_call name=Bash arguments='{"command'        finish_reason=length    ← 无任何错误提示
+非流式 content='' tool_calls=[arguments='{"command']    finish_reason=length
+```
+
+现在：
+
+- `invalid:true` 的调用**不再转发**，也不进入聚合结果——它的参数根本无法解析；
+- 同一次失败只上报一次：`tool-error` 的完整句子取代占位原因（按 `toolCallId` 去重）；
+- 流结束时若仍有被拒绝但未被解释的调用，兜底补发错误块——绝不静默；
+- `finish_reason` 仍按上游 `tool-calls` 映射为 `tool_calls`（这部分本来就正确）。
+
+同时修掉一个**更隐蔽**的问题：`cliStreamState` 原先不记录流内错误，`aggregate()` 也忽略错误块，
+于是上游发 `{"type":"error",…}` 时，**非流式调用会拿到 HTTP 200 + 空消息 + `finish_reason:stop`**：
+
+```json
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"","role":"assistant"}}]}
+```
+
+现在这类失败让非流式路径返回 502 并带上原因。顺带修正 `error` 事件的原因读取：上游把原因嵌在
+`error.message` 里，旧代码读的是扁平字段，取不到就退化成 `commandcode cli stream error`，
+现在读到的是上游原句（例如 `Messages with role 'tool' must be a response to a preceding message
+with 'tool_calls'`）。
+
+`cli_stream_failures_test.go` 用抓取到的**真实事件字节**做夹具，覆盖：拒绝调用不转发、一次失败
+只报一次、无 `tool-error` 时兜底补发、嵌套原因不丢失、合法调用不受影响、非流式失败改为报错、
+合法调用的聚合结果。变异验证三轮：去掉 `invalid` 守卫、去掉 `noteStreamErr`、去掉非流式检查，
+各自对应用例立即失败，并逐字复现了上面两段旧行为。
