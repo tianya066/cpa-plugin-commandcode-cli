@@ -213,7 +213,10 @@ func (e *Executor) autoCLIFallback() bool {
 // executeCLI runs one non-streaming request through the CLI route by draining
 // the event stream and aggregating it.
 func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest, members []APIKeyEntry) (pluginapi.ExecutorResponse, error) {
+	// The vendor name goes upstream; the response echoes what the client asked
+	// for, so a caller never sees a model it did not request.
 	model := e.upstreamModelFor(req)
+	echoModel := e.responseModelFor(req)
 	body := e.buildCLIBody(model, req.Payload)
 	var lastErr error
 	for _, idx := range e.keypool.order(members) {
@@ -238,7 +241,7 @@ func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest
 			}
 			return pluginapi.ExecutorResponse{}, lastErr
 		}
-		stream, state := e.cliEventStream(ctx, chunks, model, streamFramingBare)
+		stream, state := e.cliEventStream(ctx, chunks, echoModel, streamFramingBare)
 		for chunk := range stream {
 			if chunk.Err != nil {
 				return pluginapi.ExecutorResponse{}, chunk.Err
@@ -303,6 +306,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 // applies before the first upstream byte only, matching the provider path.
 func (e *Executor) executeCLIStream(ctx context.Context, req pluginapi.ExecutorRequest, members []APIKeyEntry, framing streamFramingPolicy) (pluginapi.ExecutorStreamResponse, error) {
 	model := e.upstreamModelFor(req)
+	echoModel := e.responseModelFor(req)
 	body := e.buildCLIBody(model, req.Payload)
 	var lastErr error
 	for _, idx := range e.keypool.order(members) {
@@ -327,7 +331,7 @@ func (e *Executor) executeCLIStream(ctx context.Context, req pluginapi.ExecutorR
 			}
 			return pluginapi.ExecutorStreamResponse{}, lastErr
 		}
-		stream, _ := e.cliEventStream(ctx, chunks, model, framing)
+		stream, _ := e.cliEventStream(ctx, chunks, echoModel, framing)
 		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: stream}, nil
 	}
 	if lastErr != nil {
@@ -344,6 +348,45 @@ func (e *Executor) upstreamModelFor(req pluginapi.ExecutorRequest) string {
 		return vendor
 	}
 	return strings.TrimSpace(req.Model)
+}
+
+// responseModelFor resolves the model name a response must echo back.
+//
+// OpenAI clients read `model` to attribute the reply, so it has to be the name
+// the client asked for. The vendor name belongs in the upstream request body
+// only: reporting it here makes every caller see a model it never requested,
+// and the host logs a model-substitution warning for each call because the two
+// names disagree.
+//
+// The host passes the client's original spelling in Metadata under
+// "requested_model"; req.Model may already be the vendor name by then. When the
+// metadata is absent, fall back to reversing the configured alias mapping so a
+// vendor name still maps back to the alias clients use.
+func (e *Executor) responseModelFor(req pluginapi.ExecutorRequest) string {
+	if requested := metadataString(req.Metadata, coreexecutor.RequestedModelMetadataKey); requested != "" {
+		return requested
+	}
+	model := strings.TrimSpace(req.Model)
+	e.cfg.ensureIndexes()
+	if alias := e.cfg.aliasFor(model); alias != "" {
+		return alias
+	}
+	return model
+}
+
+// metadataString reads one metadata value as a trimmed string.
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil || key == "" {
+		return ""
+	}
+	raw, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	if text, isText := raw.(string); isText {
+		return strings.TrimSpace(text)
+	}
+	return ""
 }
 
 // convertChunks normalizes each upstream SSE data payload (reasoning

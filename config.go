@@ -57,6 +57,7 @@ type pluginConfig struct {
 	// Derived from Models at parse time (see buildIndexes). Not YAML fields.
 	claimed  map[string]struct{}
 	rewrites map[string]string
+	aliases  map[string]string
 }
 
 // ModelEntry maps a client-facing alias to the name the vendor serves, using
@@ -179,6 +180,7 @@ func (c *pluginConfig) buildIndexes() {
 	entries := c.effectiveModels()
 	c.claimed = make(map[string]struct{}, len(entries)*2)
 	c.rewrites = make(map[string]string, len(entries)*2)
+	c.aliases = make(map[string]string, len(entries)*2)
 	for _, entry := range entries {
 		alias := normalizeModel(entry.Alias)
 		name := strings.TrimSpace(entry.Name)
@@ -200,6 +202,14 @@ func (c *pluginConfig) buildIndexes() {
 		}
 		if normalizedName != "" {
 			c.rewrites[normalizedName] = name
+		}
+		// Reverse map: the vendor name a response may carry resolves back to the
+		// alias clients actually request, so responses echo the requested name.
+		if alias != "" {
+			c.aliases[name] = entry.Alias
+			if normalizedName != "" {
+				c.aliases[normalizedName] = entry.Alias
+			}
 		}
 	}
 }
@@ -232,6 +242,16 @@ func (c *pluginConfig) upstreamName(model string) string {
 		return ""
 	}
 	return c.rewrites[normalizeModel(model)]
+}
+
+// aliasFor returns the client-facing alias configured for a model name.
+// An empty result means the name is already an alias (or unconfigured), so it
+// can be echoed to the client unchanged.
+func (c *pluginConfig) aliasFor(model string) string {
+	if c == nil || len(c.aliases) == 0 {
+		return ""
+	}
+	return c.aliases[normalizeModel(model)]
 }
 
 func (c *pluginConfig) baseURL() string {

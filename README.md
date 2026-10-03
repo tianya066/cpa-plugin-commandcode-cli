@@ -258,3 +258,23 @@ CLI 通道的默认 `User-Agent` 曾写成 `cli-proxy-commandcode/<ver> (+https:
 现在默认值是不含 URL 的 `cli-proxy-commandcode/<version>`。`cli_local_test.go` 增加了断言：
 UA 必须标识客户端，且**不得**出现 `http`、`github.com` 或括号包裹的来源说明。
 需要不同标识时用 `cli_user_agent:` 覆盖。
+
+### 响应 model 回显请求名（0.7.4）
+
+OpenAI 客户端用响应里的 `model` 做归属判断，所以它必须是**客户端请求的那个名字**。
+早期版本把上游名同时用于请求体和响应回填，于是请求 `cc-deepseek-v4.1-flash` 会收到
+`model: deepseek/deepseek-v4.1-flash-fast`——客户端看到一个自己从未请求过的模型，
+宿主也会因此对每次调用记录一条 model-substitution 警告。
+
+现在两者分开：
+
+- 上游请求体继续使用 `name`（上游模型名），CLI 路由不接受裸别名；
+- 响应 `model` 回显客户端请求名，取值顺序为
+  ① 宿主传入的 `requested_model` 元数据 → ② 配置的 alias 反查 → ③ 原样回显。
+
+`executor_model_echo_test.go` 覆盖该契约，包括流式 chunk 与非流式聚合两条路径，
+并断言请求体仍使用上游名。变异验证：把响应改回上游名后，5 个用例立即失败。
+
+> 面板里的第三个字段 `display_name` 只是展示标签，不影响调用链路。
+> 若它与 alias 不一致（例如给 `glm-5.3-flash` 填了 `cc-glm-5.3-flash`），
+> 只会让映射看起来混乱，建议留空或与 alias 保持一致。
