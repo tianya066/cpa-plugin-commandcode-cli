@@ -185,7 +185,7 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 		}
 		if status < 200 || status >= 300 {
 			lastErr = statusError{statusCode: status, body: respBody}
-			if retryable(status, nil) && ctx.Err() == nil {
+			if retryableBody(status, respBody) && ctx.Err() == nil {
 				continue
 			}
 			// transport=auto: a plan that has no Provider API access is served
@@ -235,8 +235,9 @@ func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest
 			return pluginapi.ExecutorResponse{}, err
 		}
 		if status < 200 || status >= 300 {
-			lastErr = statusError{statusCode: status, body: readStreamErrorBody(ctx, chunks)}
-			if retryable(status, nil) && ctx.Err() == nil {
+			errBody := readStreamErrorBody(ctx, chunks)
+			lastErr = statusError{statusCode: status, body: errBody}
+			if retryableBody(status, errBody) && ctx.Err() == nil {
 				continue
 			}
 			return pluginapi.ExecutorResponse{}, lastErr
@@ -286,7 +287,7 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		if status < 200 || status >= 300 {
 			errBody := readStreamErrorBody(ctx, chunks)
 			lastErr = statusError{statusCode: status, body: errBody}
-			if retryable(status, nil) && ctx.Err() == nil {
+			if retryableBody(status, errBody) && ctx.Err() == nil {
 				continue
 			}
 			if e.autoCLIFallback() && planRefusal(status, errBody) {
@@ -325,8 +326,9 @@ func (e *Executor) executeCLIStream(ctx context.Context, req pluginapi.ExecutorR
 			return pluginapi.ExecutorStreamResponse{}, err
 		}
 		if status < 200 || status >= 300 {
-			lastErr = statusError{statusCode: status, body: readStreamErrorBody(ctx, chunks)}
-			if retryable(status, nil) && ctx.Err() == nil {
+			errBody := readStreamErrorBody(ctx, chunks)
+			lastErr = statusError{statusCode: status, body: errBody}
+			if retryableBody(status, errBody) && ctx.Err() == nil {
 				continue
 			}
 			return pluginapi.ExecutorStreamResponse{}, lastErr

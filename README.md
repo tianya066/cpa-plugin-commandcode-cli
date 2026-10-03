@@ -278,3 +278,55 @@ OpenAI 客户端用响应里的 `model` 做归属判断，所以它必须是**�
 > 面板里的第三个字段 `display_name` 只是展示标签，不影响调用链路。
 > 若它与 alias 不一致（例如给 `glm-5.3-flash` 填了 `cc-glm-5.3-flash`），
 > 只会让映射看起来混乱，建议留空或与 alias 保持一致。
+
+### 工具调用消息形状（0.7.5 修复）
+
+CLI 路由收的是 AI SDK 的 `ModelMessage`，不是 OpenAI 消息形状。把 OpenAI 请求原样转发，
+带工具历史的调用一定会被上游拒绝，逐字报：
+
+```
+Invalid option: expected one of "user"|"assistant" at "params.messages[N].role"
+or Invalid input: expected array, received string at "params.messages[N].content"
+```
+
+两个字段都对不上：`role:"tool"` 不在允许的 role 里，且该分支要求 content 是**数组**；
+assistant 用 `tool_calls` 字段声明调用也无效——上游的 zod 双报错恰好说明
+`{role:"tool", content: [...]}` 才是它的第二分支。
+
+转换规则（`cli_tool_messages.go`）：
+
+- assistant 带 `tool_calls` → content 变为
+  `[{"type":"tool-call","toolCallId":…,"toolName":…,"input":{…}}]`，
+  `input` 由 `arguments` 字符串解析成对象；
+- `role:"tool"` → `{"role":"tool","content":[{"type":"tool-result","toolCallId":…,"toolName":…,"output":{"type":"text","value":…}}]}`，
+  上游用 id 把它匹配到前一条 assistant 的调用；
+- 找不到归属调用的孤岛工具结果降级为普通 user 文本——上游对这类消息会报
+  `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`，
+  整条请求会因此 400；
+- 没有工具调用的文本消息保持原形状，纯文本对话字节级不变。
+
+`cli_tool_messages_test.go` 覆盖单调用、并行调用（一条 assistant 多个调用 + 多条结果）、
+孤岛降级与文本形状回归。变异验证：把工具结果改回「role tool + 字符串 content」、
+把 assistant 改回 `tool_calls` 字段，两轮各有用例立即失败。
+
+### 额度耗尽的 Key 不再让整条调用失败（0.7.5）
+
+上游对「账号额度用完」返回的是 **400**：
+
+```json
+{"success":false,"error":{"code":"BAD_REQUEST","status":400,
+ "message":"You have insufficient credits to make this request. ..."}}
+```
+
+这是**关于 Key** 的失败，不是关于请求的失败——同一个池里另一个账号可能还有额度。
+原先的策略把 400/403/404/422 一律当成「请求本身有问题，换 Key 没用」直接放弃，
+于是池里只要有一个账号被用光，权重越高越容易先撞上它，整个 provider 就表现为不可用。
+
+现在 `retryableBody` 给这条规则开了一个窄口子：只有 **400 且响应体带
+`insufficient credits`** 才继续转移；校验类 400（例如消息形状错误）仍然立即失败，
+不会拿多个账号反复重试一条必然被拒的请求。
+
+`pool_credit_failover_test.go` 覆盖谓词真值表、一个「权重 10 的耗尽账号 + 权重 1 的正常
+账号」跑 20 轮必须全部成功（若转移失效，靠随机顺序每轮都先选中正常账号的概率是
+(1/11)^20），以及「校验 400 只打一次上游」的反向断言。变异验证：换掉额度标记后，
+两轮用例立即失败，报错正是客户端看到的 `You have insufficient credits ...`。

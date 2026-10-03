@@ -75,7 +75,7 @@ import (
 
 // pluginVersion is overridden at release build time. build.sh also injects
 // the library package's descriptor version with the same value.
-var pluginVersion = "0.7.4"
+var pluginVersion = "0.7.5"
 
 // abiSchemaVersion is the RPC contract version reported at plugin.register.
 //

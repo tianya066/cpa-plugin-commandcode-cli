@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -263,7 +264,7 @@ func proxyTransport(proxyURL string) (http.RoundTripper, error) {
 // the next pool member: transport errors, 429, 401 (bad/expired key —
 // another member may be fine; 401 from ALL members surfaces as 401), and
 // 5xx. Other 4xx (400/403/404/422) fail fast: the request itself is bad,
-// retrying another key won't help.
+// retrying another key won't help. See retryableBody for the one exception.
 func retryable(status int, err error) bool {
 	if err != nil {
 		return true
@@ -272,4 +273,21 @@ func retryable(status int, err error) bool {
 		return true
 	}
 	return false
+}
+
+// creditRefusalMarker is how the CLI route reports a KEY-level refusal: the
+// account behind that key is out of credits while the request itself is valid,
+// so another pool member can still serve it. The route answers 400, and a
+// blanket "400 is not retryable" fails a call a sibling key could serve —
+// observed on a three-account pool where one account was drained.
+const creditRefusalMarker = "insufficient credits"
+
+// retryableBody extends retryable with the body-aware exception: a 400 whose
+// body carries the credit refusal describes the KEY, not the request.
+func retryableBody(status int, body []byte) bool {
+	if retryable(status, nil) {
+		return true
+	}
+	return status == http.StatusBadRequest &&
+		bytes.Contains(bytes.ToLower(body), []byte(creditRefusalMarker))
 }

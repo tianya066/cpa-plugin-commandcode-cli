@@ -275,6 +275,24 @@ func cliMessages(raw any) ([]any, any) {
 	if !ok {
 		return []any{}, ""
 	}
+	// The route names a tool result by the call it answers, so collect the
+	// assistant's call names first: a tool turn only carries the id.
+	callNames := map[string]string{}
+	for _, item := range list {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, call := range openAIToolCalls(msg) {
+			id, _ := call["id"].(string)
+			if id == "" {
+				continue
+			}
+			fn, _ := call["function"].(map[string]any)
+			name, _ := fn["name"].(string)
+			callNames[id] = name
+		}
+	}
 	out := make([]any, 0, len(list))
 	var systemParts []string
 	for _, item := range list {
@@ -289,10 +307,17 @@ func cliMessages(raw any) ([]any, any) {
 			}
 			continue
 		}
-		out = append(out, map[string]any{
-			"role":    role,
-			"content": cliContentBlocks(msg["content"]),
-		})
+		switch {
+		case strings.EqualFold(role, "assistant"):
+			out = append(out, cliAssistantMessage(msg, callNames))
+		case strings.EqualFold(role, "tool"), strings.EqualFold(role, "function"):
+			out = append(out, cliToolMessage(msg, callNames, openToolCallIDs(out)))
+		default:
+			out = append(out, map[string]any{
+				"role":    role,
+				"content": cliContentBlocks(msg["content"]),
+			})
+		}
 	}
 	if len(systemParts) == 0 {
 		return out, ""
