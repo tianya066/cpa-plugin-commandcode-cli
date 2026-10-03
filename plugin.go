@@ -15,6 +15,7 @@ package plugin
 import (
 	"context"
 	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -36,15 +37,19 @@ const (
 
 // pluginVersion tracks the release; cmd/commandcode/abi.go carries its own
 // copy for registration metadata (injected via ldflags at release time).
-var pluginVersion = "0.3.3"
+var pluginVersion = "0.7.1"
 
 // CommandCodePlugin wires model metadata, routing, translation and execution.
 type CommandCodePlugin struct {
-	models     *ModelProvider
-	router     *Router
-	translator *Translator
-	executor   *Executor
-	cfg        *pluginConfig
+	models       *ModelProvider
+	router       *Router
+	translator   *Translator
+	executor     *Executor
+	cfg          *pluginConfig
+	settingsMu   sync.Mutex
+	accountMu    sync.Mutex
+	accountCache map[string]accountCacheEntry
+	accountSlots chan struct{}
 }
 
 // Build constructs the host-facing plugin description from the raw
@@ -65,8 +70,8 @@ func Build(configYAML []byte) (pluginapi.Plugin, *CommandCodePlugin) {
 		Metadata: pluginapi.Metadata{
 			Name:             "CommandCode Provider",
 			Version:          pluginVersion,
-			Author:           "cpa-admin",
-			GitHubRepository: "https://github.com/ahoo/cpa-plugin-commandcode",
+			Author:           "tianya066",
+			GitHubRepository: "https://github.com/tianya066/cpa-plugin-commandcode-cli",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "transport", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"provider", "cli", "auto"},
 					Description: "上游通道：provider 走 /provider/v1（Provider 及以上套餐）；cli 走 /alpha/generate（Go/GOAT/Pro/Max 套餐的 CLI 通道）；auto 先试 provider，遇套餐拒绝自动改走 CLI。留空等于 provider。"},

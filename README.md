@@ -65,8 +65,9 @@ plugins:
           name: z-ai/glm-5.3-flash
 ```
 
-Restart CPA after changing the config (`docker restart cli-proxy-api`); the host does
-not hot-reload plugin configuration.
+CPA v8.0.11 reloads plugin configuration through `plugin.reconfigure`. The management
+page waits for the runtime revision to match the saved revision before reporting
+success. Installing a new shared library remains a separate deployment operation.
 
 ## What the CLI transport does
 
@@ -168,53 +169,65 @@ impersonating the vendor's client, and this fork follows that policy. Override i
 
 `projectSlug` follows the reference implementation's `projectSlugFromPath`: lower-cased,
 non-alphanumerics collapsed to single dashes, drive prefix dropped, edges trimmed.
-## Management panel
+## 统一管理页 / Management panel
 
-The plugin contributes its own page to the CPA Management Center (menu entry
-**CommandCode**) plus seven editable config fields, so the panel shows the channel
-state instead of an empty plugin row.
+在 CPA 管理中心打开 **CommandCode**。首次打开时输入 CPA 管理密钥并点击
+“连接并读取”。管理密钥与 CommandCode 上游 Key 是两种不同的凭据。
+
+页面支持：
+
+- 新增、替换、删除和禁用 Key；设置备注、选择权重和每个 Key 的代理。
+- 分别查看每个账号、订阅、余额、5 小时/每周额度及具体错误。
+- 编辑客户端模型别名、上游模型名称和显示名称。
+- 选择 CLI、Provider 或自动通道；Go/GOAT/Pro/Max 账号使用 CLI 通道。
+- 对单个已保存 Key 发起少量实际调用，显示文本、状态和耗时。
+- 保存时检查配置版本，保存后等待运行时确认生效，无需逐次重启 CPA。
+
+已有 Key 只显示掩码。替换输入留空会保留原值，代理也必须显式修改或清除。
+删除在保存前可撤销；配置冲突不会自动覆盖另一次修改。
 
 | Route | Purpose |
 |---|---|
-| `GET /v0/resource/plugins/commandcode/index.html` | the panel page (self-contained HTML, no build step) |
-| `GET /v0/management/commandcode/status` | JSON behind the page: transport, model map, key pool, account |
+| `GET /v0/resource/plugins/commandcode/index.html` | Self-contained management page |
+| `GET /v0/management/commandcode/status` | Runtime revision and per-key accounts/quotas; `?refresh=1` bypasses cache |
+| `GET /v0/management/commandcode/settings` | Masked saved settings and runtime revision |
+| `POST /v0/management/commandcode/settings` | Validated configuration update with optimistic revision check |
+| `POST /v0/management/commandcode/test` | Small inference probe for one saved key |
 
-The page renders:
+Every management route requires the CPA management credential. The plugin forwards
+that credential only to the local CPA management API to preserve the existing config
+and trigger reconfiguration. The default local management endpoint is
+`http://127.0.0.1:8317`; `management_base_url` supports another loopback listener.
 
-* **transport & endpoints** — `provider` / `cli` / `auto`, the provider base URL, and the
-  CLI base URL + version header when the CLI route is in use
-* **account** — email and subscription status from `/alpha/whoami` and
-  `/alpha/billing/subscriptions`
-* **plan quota** — monthly credits and the rolling 5-hour / weekly windows with used/cap,
-  progress bars and reset countdown, from `/alpha/billing/credits`
-* **key pool** — every configured credential with weight, proxy flag and disabled state
-  (values are masked; the panel never receives a full key)
-* **model map** — client alias → upstream name → `commandcode/...` namespace id
+Account queries use the current management request's HTTP callback, never one retained
+from a completed inference. Results are cached per plugin instance for 30 seconds;
+reconfiguration discards the old cache. Individual accounts may fail independently.
 
-Account reads reuse the host HTTP client captured from the last executor request, falling
-back to a plain client before any request has been seen; results are cached for 30 s so a
-page reload does not hammer the account endpoints.
+### 从自定义供应商迁移
 
-`transport`, `cli_version`, `cli_base_url`, `cli_working_dir`, `cli_user_agent`,
-`base_url` and `priority` are declared as `ConfigField`s, so the panel can render them.
-The CLI route still needs a restart after a config change (the host does not hot-reload
-plugin configuration).
+`api-keys.openai-compatibility` 的 CommandCode Key 与
+`plugins.configs.commandcode.api_keys` 是两份不同配置，不会自动同步。
+迁移时先备份并将现有 Key 去重导入插件，然后在插件里保留客户端正在使用的
+别名、确认每个 Key 能调用，最后停用旧 CommandCode 供应商。
+
+例如，保留 `cc-deepseek-v4.1-flash` 别名并将上游名称设置为
+`deepseek/deepseek-v4.1-flash`。插件会自己完成路由与执行，不需要再建立同名
+OpenAI-compatible 供应商。CPA 继续提供客户端鉴权、统一 API 和协议转换。
 
 ### Panel authentication
 
-The page document is served from the plugin resource route (unauthenticated),
-while its data comes from `/v0/management/commandcode/status`, which the host
-protects with the management key. The page resolves the key in this order:
+The page may reuse the CPA panel's remembered management credential or an explicitly
+remembered `commandcode-management-key`. It also supports a session-only credential.
+Management credentials are not accepted from URL parameters; CommandCode keys are
+never saved in browser storage. On 401/403, requests stop and the page directs the
+operator to the management credential input.
 
-1. **its own entry** `localStorage["commandcode-management-key"]` — paste the CPA
-   management key into the box at the top of the page once and press 保存; this is
-   the reliable path and the same approach the clinepass plugin page uses;
-2. `localStorage["managementKey"]`, which the panel writes only when you tick
-   **记住密码** at login (XOR-obfuscated with
-   `"cli-proxy-api-webui::secure-storage|<host>|<userAgent>"`, `enc::v1::` prefix —
-   the page de-obfuscates it exactly like the panel store does);
-3. `localStorage["cli-proxy-auth"]` (the panel's zustand blob), if it ever carries
-   `state.managementKey`;
-4. `?key=<management key>` on the page URL.
+### ABI 状态码（0.7.1 修复）
 
-If the page reports `HTTP 401`, paste the key into the box and press 保存 once.
+宿主的 `management.handle` 返回值由 `pluginapi.ManagementResponse` 解码，该结构体
+没有 JSON 标签，字段名是 `StatusCode` / `Headers` / `Body`。因此插件在信封结果里
+必须使用这些 Go 字段名；早期版本发的是 `status_code`，`encoding/json` 既不报错也不
+匹配，导致每个 4xx/5xx 都被静默改写成 HTTP 200，页面的 401 与 409 分支永远不生效。
+
+现在编码统一走 `ManagementEnvelope`，并由
+`TestManagementEnvelopeRoundTripsThroughSDKType` 用 SDK 类型解码回归。

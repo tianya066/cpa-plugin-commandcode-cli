@@ -182,7 +182,7 @@ func (c *pluginConfig) cliUserAgent() string {
 			return ua
 		}
 	}
-	return "cli-proxy-commandcode/" + pluginVersion + " (+https://github.com/ahoo/cpa-plugin-commandcode)"
+	return "cli-proxy-commandcode/" + pluginVersion + " (+https://github.com/tianya066/cpa-plugin-commandcode-cli)"
 }
 
 // projectSlug renders a working directory the way the reference implementation

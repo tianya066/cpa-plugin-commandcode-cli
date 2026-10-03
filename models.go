@@ -25,15 +25,20 @@ type modelDef struct {
 
 // registryModels builds the advertised list from configuration.
 //
-// NOTE: IDs use the commandcode/ namespace deliberately. The host's native
-// openai-compatibility channel (cmd-订阅) already registers the bare upstream
-// names; RegisterExecutors skips plugin models that any native executor serves
-// (modelHasNativeExecutor), so reusing those IDs would leave this executor
-// permanently unregistered. The router matches client aliases to this
-// executor, so clients keep requesting deepseek-flash unchanged.
+// Namespaced upstream IDs keep an executor registration anchor when a native
+// provider owns a matching client alias. Bare aliases are advertised as well,
+// so clients can discover the configured names through /v1/models.
 func (p *ModelProvider) registryModels() []modelDef {
 	entries := p.cfg.effectiveModels()
-	defs := make([]modelDef, 0, len(entries))
+	defs := make([]modelDef, 0, 2*len(entries))
+	seen := make(map[string]bool, 2*len(entries))
+	add := func(id, label string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		defs = append(defs, modelDef{id: id, displayName: label + " via CommandCode"})
+	}
 	for _, entry := range entries {
 		// Prefer the upstream name for the ID: it is the name the vendor
 		// actually serves, so the advertised model stays meaningful across
@@ -45,10 +50,10 @@ func (p *ModelProvider) registryModels() []modelDef {
 		if name == "" {
 			continue
 		}
-		defs = append(defs, modelDef{
-			id:          Provider + "/" + name,
-			displayName: entry.label() + " via CommandCode",
-		})
+		add(Provider+"/"+name, entry.label())
+	}
+	for _, entry := range entries {
+		add(strings.TrimSpace(entry.Alias), entry.label())
 	}
 	return defs
 }

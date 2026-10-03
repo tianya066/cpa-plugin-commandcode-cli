@@ -13,6 +13,8 @@ import (
 type pluginConfig struct {
 	Enabled  bool `yaml:"enabled"`
 	Priority int  `yaml:"priority"`
+	// ManagementBaseURL is the local CPA listener used for persisted settings.
+	ManagementBaseURL string `yaml:"management_base_url"`
 	// Models declares which models this plugin claims. Entries are structured
 	// ("- alias: x / upstream: y") or bare strings ("- x"); a bare string only
 	// claims the name and never rewrites it.
@@ -69,12 +71,12 @@ type pluginConfig struct {
 // which is only correct for aliases the host itself resolves.
 type ModelEntry struct {
 	// Alias is the client-facing name, e.g. "deepseek-flash".
-	Alias string `yaml:"alias"`
+	Alias string `yaml:"alias" json:"alias"`
 	// Name is the model name sent upstream. Empty forwards Alias unchanged.
-	Name string `yaml:"name"`
+	Name string `yaml:"name" json:"name"`
 	// DisplayName is the optional label for model registration; falls back to
 	// Name, then Alias.
-	DisplayName string `yaml:"display_name"`
+	DisplayName string `yaml:"display_name" json:"display_name"`
 }
 
 // UnmarshalYAML accepts both the structured mapping and the legacy bare string
@@ -109,6 +111,7 @@ func (m ModelEntry) label() string {
 // them from the configuration (hot-toggled via reconfigure, no restart of
 // the plugin build needed).
 type APIKeyEntry struct {
+	Name     string `yaml:"name"`
 	Key      string `yaml:"key"`
 	Weight   int    `yaml:"weight"`
 	ProxyURL string `yaml:"proxy_url"`

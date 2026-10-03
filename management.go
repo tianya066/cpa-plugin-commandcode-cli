@@ -1,52 +1,44 @@
 package plugin
 
-// Management panel support.
-//
-// The host exposes plugin-owned Management API routes under /v0/management/ and
-// browser-navigable resources under /v0/resource/plugins/<id>/. Registering a GET
-// route with a Menu label makes the host list it in the Management Center's menu;
-// the page itself is a small self-contained HTML document that fetches the JSON
-// routes below.
-//
-// Two routes are served:
-//
-//	GET <base>/commandcode/status   → JSON: transport, model map, key pool, plan
-//	GET <base>/commandcode/index.html → the panel page (resource, menu entry)
-//
-// The plan/quota section reads CommandCode's own account surface
-// (/alpha/whoami, /alpha/billing/credits, /alpha/billing/subscriptions), which is
-// available on every plan tier, so the panel shows the account even when the
-// chat route is refused.
-
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// managementBasePath is the plugin's Management API prefix.
 const managementBasePath = "/commandcode"
-
-// statusCacheTTL keeps the panel from hammering the account endpoints: the host
-// calls the route on every page load, and the values only move slowly.
 const statusCacheTTL = 30 * time.Second
 
-var statusCache = struct {
-	sync.Mutex
-	at     time.Time
-	body   []byte
-	status int
-}{}
+type managementClientKey struct{}
 
-// registerManagementRoutes declares the plugin's Management API routes and its
+// WithManagementHTTPClient binds the current ABI callback to this request only.
+// Never retain the client: the host closes its callback when the request ends.
+func WithManagementHTTPClient(ctx context.Context, client pluginapi.HostHTTPClient) context.Context {
+	return context.WithValue(ctx, managementClientKey{}, client)
+}
+
+func managementHTTPClient(ctx context.Context) pluginapi.HostHTTPClient {
+	client, _ := ctx.Value(managementClientKey{}).(pluginapi.HostHTTPClient)
+	return client
+}
+
+type accountCacheEntry struct {
+	at      time.Time
+	account map[string]any
+}
+
 func (p *CommandCodePlugin) registerManagementRoutes(_ context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
 	base := strings.TrimSuffix(strings.TrimSpace(req.BasePath), "/")
 	if base == "" {
@@ -55,209 +47,195 @@ func (p *CommandCodePlugin) registerManagementRoutes(_ context.Context, req plug
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: base + "/status", Handler: p},
+			{Method: http.MethodGet, Path: base + "/settings", Handler: p},
+			{Method: http.MethodPost, Path: base + "/settings", Handler: p},
+			{Method: http.MethodPost, Path: base + "/test", Handler: p},
 		},
-		Resources: []pluginapi.ResourceRoute{
-			{Path: "/index.html", Menu: "CommandCode", Description: "CommandCode 渠道状态与套餐额度", Handler: p},
-		},
+		Resources: []pluginapi.ResourceRoute{{Path: "/index.html", Menu: "CommandCode", Description: "CommandCode 账号、模型与运行设置", Handler: p}},
 	}, nil
 }
 
-// handleManagementRequest serves the plugin's own routes.
 func (p *CommandCodePlugin) handleManagementRequest(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	path := strings.TrimSpace(req.Path)
+	method := strings.ToUpper(req.Method)
+	var allowed string
 	switch {
 	case strings.HasSuffix(path, "/status"):
-		return p.managementStatus(ctx)
+		allowed = http.MethodGet
+		if method == allowed {
+			return p.managementStatus(ctx, req.Query.Get("refresh") == "1")
+		}
+	case strings.HasSuffix(path, "/settings"):
+		allowed = "GET, POST"
+		if method == http.MethodGet {
+			return p.managementSettings(ctx, req)
+		}
+		if method == http.MethodPost {
+			return p.saveManagementSettings(ctx, req)
+		}
+	case strings.HasSuffix(path, "/test"):
+		allowed = http.MethodPost
+		if method == allowed {
+			return p.managementTest(ctx, req)
+		}
 	case strings.HasSuffix(path, "/index.html"), path == "" || strings.HasSuffix(path, "/"):
-		return managementPage(), nil
+		allowed = http.MethodGet
+		if method == allowed {
+			return managementPage(), nil
+		}
 	default:
-		return pluginapi.ManagementResponse{StatusCode: http.StatusNotFound, Body: []byte(`{"error":"not found"}`)}, nil
+		return managementError(http.StatusNotFound, "not found"), nil
 	}
+	resp := managementError(http.StatusMethodNotAllowed, "method not allowed")
+	resp.Headers.Set("Allow", allowed)
+	return resp, nil
 }
 
-// managementStatus returns the plugin's runtime state plus the live account view.
-func (p *CommandCodePlugin) managementStatus(ctx context.Context) (pluginapi.ManagementResponse, error) {
-	statusCache.Lock()
-	if len(statusCache.body) > 0 && time.Since(statusCache.at) < statusCacheTTL {
-		body, code := statusCache.body, statusCache.status
-		statusCache.Unlock()
-		return pluginapi.ManagementResponse{StatusCode: code, Headers: jsonHeaders(), Body: body}, nil
+func (p *CommandCodePlugin) managementStatus(ctx context.Context, refresh bool) (pluginapi.ManagementResponse, error) {
+	models := make([]map[string]any, 0)
+	for _, entry := range p.cfg.effectiveModels() {
+		models = append(models, map[string]any{"alias": entry.Alias, "upstream": entry.Name, "namespace": Provider + "/" + firstNonEmpty(entry.Name, entry.Alias), "label": entry.label()})
 	}
-	statusCache.Unlock()
-
-	payload := map[string]any{
-		"plugin":       "commandcode",
-		"version":      pluginVersion,
-		"transport":    p.cfg.transportMode(),
-		"base_url":     p.cfg.baseURL(),
-		"cli_base":     p.cfg.cliBaseURL(),
-		"cli_version":  p.cfg.cliVersion(),
-		"generated_at": time.Now().Format(time.RFC3339),
+	entries := configuredKeys(p.cfg)
+	accounts := make([]map[string]any, len(entries))
+	var wg sync.WaitGroup
+	for i, entry := range entries {
+		wg.Add(1)
+		go func(i int, entry APIKeyEntry) {
+			defer wg.Done()
+			row := keyView(entry)
+			row["account"] = p.accountView(ctx, entry, refresh)
+			accounts[i] = row
+		}(i, entry)
 	}
-
-	entries := p.cfg.effectiveModels()
-	models := make([]map[string]any, 0, len(entries))
-	for _, entry := range entries {
-		models = append(models, map[string]any{
-			"alias":     entry.Alias,
-			"upstream":  entry.Name,
-			"namespace": Provider + "/" + firstNonEmpty(entry.Name, entry.Alias),
-			"label":     entry.label(),
-		})
+	wg.Wait()
+	var first any = map[string]any{"error": "no api key configured"}
+	if len(accounts) > 0 {
+		first = accounts[0]["account"]
 	}
-	payload["models"] = models
-
-	payload["keys"] = p.keyPoolView()
-	payload["account"] = p.accountView(ctx)
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return pluginapi.ManagementResponse{StatusCode: http.StatusInternalServerError, Body: []byte(`{"error":"marshal failed"}`)}, nil
-	}
-	statusCache.Lock()
-	statusCache.at, statusCache.body, statusCache.status = time.Now(), body, http.StatusOK
-	statusCache.Unlock()
-	return pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: jsonHeaders(), Body: body}, nil
+	return managementJSON(http.StatusOK, map[string]any{
+		"plugin": "commandcode", "version": pluginVersion,
+		"revision": configRevision(p.cfg), "transport": p.cfg.transportMode(),
+		"base_url": p.cfg.baseURL(), "cli_base": p.cfg.cliBaseURL(), "cli_version": p.cfg.cliVersion(),
+		"generated_at": time.Now().Format(time.RFC3339), "models": models,
+		"keys": p.keyPoolView(), "accounts": accounts, "account": first,
+	}), nil
 }
 
-// keyPoolView lists the configured credentials without exposing them.
+func configuredKeys(cfg *pluginConfig) []APIKeyEntry {
+	out := make([]APIKeyEntry, 0, len(cfg.APIKeys))
+	for _, entry := range cfg.APIKeys {
+		entry.Key = strings.TrimSpace(entry.Key)
+		if entry.Key != "" {
+			out = append(out, entry)
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(cfg.APIKey) != "" {
+		out = append(out, APIKeyEntry{Key: strings.TrimSpace(cfg.APIKey), Weight: 1})
+	}
+	return out
+}
+
+func credentialID(key string) string {
+	hash := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	return hex.EncodeToString(hash[:16])
+}
+
+func keyView(entry APIKeyEntry) map[string]any {
+	return map[string]any{"id": credentialID(entry.Key), "label": maskCredential(entry.Key), "name": entry.Name, "weight": entry.normWeight(), "disabled": entry.Disabled, "proxy": strings.TrimSpace(entry.ProxyURL) != ""}
+}
+
 func (p *CommandCodePlugin) keyPoolView() []map[string]any {
-	out := make([]map[string]any, 0, len(p.cfg.APIKeys))
-	for _, entry := range p.cfg.APIKeys {
-		key := strings.TrimSpace(entry.Key)
-		if key == "" {
-			continue
-		}
-		row := map[string]any{
-			"label":    maskCredential(key),
-			"weight":   entry.normWeight(),
-			"disabled": entry.Disabled,
-			"proxy":    strings.TrimSpace(entry.ProxyURL) != "",
-		}
-		out = append(out, row)
-	}
-	if len(out) == 0 && strings.TrimSpace(p.cfg.APIKey) != "" {
-		out = append(out, map[string]any{
-			"label": maskCredential(strings.TrimSpace(p.cfg.APIKey)), "weight": 1, "disabled": false, "proxy": false,
-		})
+	out := make([]map[string]any, 0)
+	for _, entry := range configuredKeys(p.cfg) {
+		out = append(out, keyView(entry))
 	}
 	return out
 }
 
-// accountView reads CommandCode's account surface. Every field is optional: a
-// failure is reported inside the payload rather than failing the page.
-func (p *CommandCodePlugin) accountView(ctx context.Context) map[string]any {
-	out := map[string]any{}
-	key := ""
-	if len(p.cfg.APIKeys) > 0 {
-		for _, entry := range p.cfg.APIKeys {
-			if !entry.Disabled && strings.TrimSpace(entry.Key) != "" {
-				key = strings.TrimSpace(entry.Key)
-				break
-			}
+func (p *CommandCodePlugin) accountView(ctx context.Context, entry APIKeyEntry, refresh bool) map[string]any {
+	if entry.Disabled {
+		return map[string]any{"disabled": true}
+	}
+	cacheKey := configRevision(p.cfg) + ":" + credentialID(entry.Key)
+	p.accountMu.Lock()
+	if p.accountSlots == nil {
+		p.accountSlots = make(chan struct{}, 3)
+	}
+	slots := p.accountSlots
+	if cached, ok := p.accountCache[cacheKey]; !refresh && ok && time.Since(cached.at) < statusCacheTTL {
+		p.accountMu.Unlock()
+		return cached.account
+	}
+	p.accountMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		return map[string]any{"error": ctx.Err().Error()}
+	}
+	// Recheck after waiting for another account request to finish.
+	p.accountMu.Lock()
+	if cached, ok := p.accountCache[cacheKey]; !refresh && ok && time.Since(cached.at) < statusCacheTTL {
+		p.accountMu.Unlock()
+		return cached.account
+	}
+	p.accountMu.Unlock()
+	client := managementHTTPClient(ctx)
+	if strings.TrimSpace(entry.ProxyURL) != "" {
+		transport, err := proxyTransport(entry.ProxyURL)
+		if err != nil {
+			return map[string]any{"error": redactForPanel(err.Error(), entry)}
 		}
+		if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+			defer closer.CloseIdleConnections()
+		}
+		client = directHTTPClient{client: &http.Client{Transport: transport, Timeout: 15 * time.Second}}
 	}
-	if key == "" {
-		key = strings.TrimSpace(p.cfg.APIKey)
-	}
-	if key == "" {
-		out["error"] = "no api key configured"
-		return out
-	}
-	client := p.accountHTTPClient()
 	if client == nil {
-		out["error"] = "host http client unavailable"
-		return out
+		return map[string]any{"error": "current management HTTP callback is unavailable"}
 	}
-
-	if who, err := p.accountGet(ctx, client, key, "/alpha/whoami?limits=1"); err == nil {
-		out["whoami"] = who
-	} else {
-		out["whoami_error"] = err.Error()
+	out := map[string]any{}
+	for _, endpoint := range []struct{ field, path string }{{"whoami", "/alpha/whoami?limits=1"}, {"credits", "/alpha/billing/credits"}, {"subscription", "/alpha/billing/subscriptions"}} {
+		if data, err := p.accountGet(ctx, client, entry.Key, endpoint.path); err == nil {
+			out[endpoint.field] = data
+		} else {
+			out[endpoint.field+"_error"] = redactForPanel(err.Error(), entry)
+		}
 	}
-	if credits, err := p.accountGet(ctx, client, key, "/alpha/billing/credits"); err == nil {
-		out["credits"] = credits
-	} else {
-		out["credits_error"] = err.Error()
+	p.accountMu.Lock()
+	if p.accountCache == nil {
+		p.accountCache = make(map[string]accountCacheEntry)
 	}
-	if sub, err := p.accountGet(ctx, client, key, "/alpha/billing/subscriptions"); err == nil {
-		out["subscription"] = sub
-	} else {
-		out["subscription_error"] = err.Error()
-	}
+	p.accountCache[cacheKey] = accountCacheEntry{at: time.Now(), account: out}
+	p.accountMu.Unlock()
 	return out
 }
 
-// accountHTTPClient returns the client used for account reads. The host client
-// (captured from the last executor request) keeps the host's proxy policy and
-// request log; before any request has been seen — a panel opened on a fresh
-// process — a plain client is used so the page still renders account data.
-func (p *CommandCodePlugin) accountHTTPClient() pluginapi.HostHTTPClient {
-	if p.executor != nil {
-		if c := p.executor.lastHostClient(); c != nil {
-			return c
-		}
-	}
-	return directHTTPClient{}
-}
+// directHTTPClient is used only for explicitly configured per-key proxy routes.
+type directHTTPClient struct{ client *http.Client }
 
-// directHTTPClient is the fallback host-client implementation for panel reads.
-type directHTTPClient struct{}
-
-func (directHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+func (c directHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
 	if err != nil {
 		return pluginapi.HTTPResponse{}, err
 	}
 	httpReq.Header = req.Headers.Clone()
-	resp, err := http.DefaultClient.Do(httpReq)
+	client := c.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return pluginapi.HTTPResponse{}, err
 	}
 	defer resp.Body.Close()
-	body, errRead := io.ReadAll(resp.Body)
-	if errRead != nil {
-		return pluginapi.HTTPResponse{StatusCode: resp.StatusCode, Headers: resp.Header}, errRead
-	}
-	return pluginapi.HTTPResponse{StatusCode: resp.StatusCode, Headers: resp.Header, Body: body}, nil
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return pluginapi.HTTPResponse{StatusCode: resp.StatusCode, Headers: resp.Header, Body: body}, err
 }
 
-func (directHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
-	if err != nil {
-		return pluginapi.HTTPStreamResponse{}, err
-	}
-	httpReq.Header = req.Headers.Clone()
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return pluginapi.HTTPStreamResponse{}, err
-	}
-	ch := make(chan pluginapi.HTTPStreamChunk)
-	go func() {
-		defer close(ch)
-		defer resp.Body.Close()
-		buf := make([]byte, 32*1024)
-		for {
-			n, errRead := resp.Body.Read(buf)
-			if n > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case ch <- pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), buf[:n]...)}:
-				}
-			}
-			if errRead != nil {
-				if errRead != io.EOF {
-					select {
-					case <-ctx.Done():
-					case ch <- pluginapi.HTTPStreamChunk{Err: errRead}:
-					}
-				}
-				return
-			}
-		}
-	}()
-	return pluginapi.HTTPStreamResponse{StatusCode: resp.StatusCode, Headers: resp.Header, Chunks: ch}, nil
+func (c directHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, fmt.Errorf("account client does not support streams")
 }
 
 func (p *CommandCodePlugin) accountGet(ctx context.Context, client pluginapi.HostHTTPClient, key, path string) (map[string]any, error) {
@@ -266,15 +244,11 @@ func (p *CommandCodePlugin) accountGet(ctx context.Context, client pluginapi.Hos
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+key)
 	headers.Set("Accept", "application/json")
-	headers.Set("accept-encoding", "identity")
+	headers.Set("Accept-Encoding", "identity")
 	headers.Set("x-command-code-version", p.cfg.cliVersion())
 	headers.Set("x-cli-environment", "production")
 	headers.Set("User-Agent", p.cfg.cliUserAgent())
-	resp, err := client.Do(reqCtx, pluginapi.HTTPRequest{
-		Method:  http.MethodGet,
-		URL:     p.cfg.cliBaseURL() + path,
-		Headers: headers,
-	})
+	resp, err := client.Do(reqCtx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: p.cfg.cliBaseURL() + path, Headers: headers})
 	if err != nil {
 		return nil, err
 	}
@@ -282,10 +256,43 @@ func (p *CommandCodePlugin) accountGet(ctx context.Context, client pluginapi.Hos
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, truncateForPanel(string(resp.Body), 160))
 	}
 	var decoded map[string]any
-	if err := json.Unmarshal(resp.Body, &decoded); err != nil {
+	if json.Unmarshal(resp.Body, &decoded) != nil {
 		return nil, fmt.Errorf("invalid json")
 	}
+	// Account endpoints should never echo credentials, but do not trust their payloads.
+	safe, _ := json.Marshal(decoded)
+	safe = bytes.ReplaceAll(safe, []byte(key), []byte("[redacted]"))
+	_ = json.Unmarshal(safe, &decoded)
 	return decoded, nil
+}
+
+func redactForPanel(text string, entries ...APIKeyEntry) string {
+	for _, entry := range entries {
+		if entry.Key != "" {
+			text = strings.ReplaceAll(text, entry.Key, "[redacted]")
+		}
+		if entry.ProxyURL != "" {
+			text = strings.ReplaceAll(text, entry.ProxyURL, safeProxyURL(entry.ProxyURL))
+			if parsed, err := url.Parse(entry.ProxyURL); err == nil && parsed.User != nil {
+				if password, ok := parsed.User.Password(); ok && password != "" {
+					text = strings.ReplaceAll(text, password, "[redacted]")
+				}
+			}
+		}
+	}
+	return text
+}
+
+func managementJSON(status int, payload any) pluginapi.ManagementResponse {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return pluginapi.ManagementResponse{StatusCode: 500, Headers: jsonHeaders(), Body: []byte(`{"error":"marshal failed"}`)}
+	}
+	return pluginapi.ManagementResponse{StatusCode: status, Headers: jsonHeaders(), Body: body}
+}
+
+func managementError(status int, message string) pluginapi.ManagementResponse {
+	return managementJSON(status, map[string]any{"error": message})
 }
 
 func jsonHeaders() http.Header {
@@ -295,10 +302,28 @@ func jsonHeaders() http.Header {
 	return h
 }
 
+// ManagementEnvelope encodes a management response for the ABI wire.
+//
+// The host decodes the envelope result into pluginapi.ManagementResponse, which
+// declares no JSON tags, so the payload must carry the Go field names
+// (StatusCode/Headers/Body). A hand-written snake_case mirror is silently
+// rejected by encoding/json and turns every 4xx/5xx into HTTP 200.
+func ManagementEnvelope(response pluginapi.ManagementResponse) ([]byte, error) {
+	status := response.StatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	result, err := json.Marshal(pluginapi.ManagementResponse{StatusCode: status, Headers: response.Headers, Body: response.Body})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(pluginabi.Envelope{OK: true, Result: result})
+}
+
 func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return v
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
 		}
 	}
 	return ""
@@ -312,7 +337,6 @@ func truncateForPanel(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// maskCredential keeps a short tail so operators can tell keys apart.
 func maskCredential(key string) string {
 	trimmed := strings.TrimSpace(key)
 	if len(trimmed) <= 8 {
@@ -321,7 +345,6 @@ func maskCredential(key string) string {
 	return trimmed[:3] + "…" + trimmed[len(trimmed)-4:]
 }
 
-// transportMode reports the configured transport with its default applied.
 func (c *pluginConfig) transportMode() string {
 	if c == nil {
 		return "provider"

@@ -67,7 +67,7 @@ import (
 
 // pluginVersion is overridden at release build time. build.sh also injects
 // the library package's descriptor version with the same value.
-var pluginVersion = "0.3.3"
+var pluginVersion = "0.7.1"
 
 var abiState = struct {
 	sync.RWMutex
@@ -103,13 +103,6 @@ type abiCapabilities struct {
 type abiManagementRequest struct {
 	pluginapi.ManagementRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
-}
-
-// abiManagementResponse mirrors pluginapi.ManagementResponse on the wire.
-type abiManagementResponse struct {
-	StatusCode int         `json:"status_code,omitempty"`
-	Headers    http.Header `json:"headers,omitempty"`
-	Body       []byte      `json:"body,omitempty"`
 }
 
 // abiManagementRegistrationResponse mirrors ManagementRegistrationResponse,
@@ -155,6 +148,7 @@ type abiExecutorStreamResponse struct {
 type abiHostHTTPRequest struct {
 	pluginapi.HTTPRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
+	OperationID    string `json:"operation_id,omitempty"`
 }
 
 type abiHostHTTPStreamResponse struct {
@@ -407,8 +401,11 @@ func handleManagementRequest(ctx context.Context, request []byte) ([]byte, error
 	}
 	var payload abiManagementRequest
 	if len(request) > 0 {
-		_ = json.Unmarshal(request, &payload)
+		if err := json.Unmarshal(request, &payload); err != nil {
+			return abiErrorEnvelope("invalid_request", "invalid management request"), nil
+		}
 	}
+	ctx = plug.WithManagementHTTPClient(ctx, abiHostHTTPClient{callbackID: payload.HostCallbackID, cancellable: true})
 	resp, err := p.HandleManagement(ctx, pluginapi.ManagementRequest{
 		Method:  payload.Method,
 		Path:    payload.Path,
@@ -419,11 +416,7 @@ func handleManagementRequest(ctx context.Context, request []byte) ([]byte, error
 	if err != nil {
 		return abiErrorEnvelope("management_failed", err.Error()), nil
 	}
-	status := resp.StatusCode
-	if status == 0 {
-		status = http.StatusOK
-	}
-	return abiOKEnvelope(abiManagementResponse{StatusCode: status, Headers: resp.Headers, Body: resp.Body})
+	return plug.ManagementEnvelope(resp)
 }
 
 func currentPlugin() (*plug.CommandCodePlugin, error) {
@@ -438,29 +431,78 @@ func currentPlugin() (*plug.CommandCodePlugin, error) {
 func nilClient(c pluginapi.HostHTTPClient) pluginapi.HostHTTPClient { return c }
 
 type abiHostHTTPClient struct {
-	callbackID string
+	callbackID  string
+	cancellable bool
+}
+
+// Management calls use v8 scoped HTTP operations so their Go deadlines also
+// cancel the actual host request. Executor requests keep their existing bridge.
+func (c abiHostHTTPClient) operation(ctx context.Context) (string, func(), error) {
+	if !c.cancellable {
+		return "", func() {}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
+	opened, err := callHost[struct {
+		OperationID string `json:"operation_id"`
+	}]("host.http.operation_open", struct {
+		HostCallbackID string `json:"host_callback_id"`
+	}{c.callbackID})
+	if err != nil {
+		return "", nil, err
+	}
+	done := make(chan struct{})
+	var once sync.Once
+	cancel := func() {
+		_, _ = callHost[abiEmptyResponse]("host.http.cancel", struct {
+			HostCallbackID string `json:"host_callback_id"`
+			OperationID    string `json:"operation_id"`
+		}{c.callbackID, opened.OperationID})
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-done:
+		}
+	}()
+	return opened.OperationID, func() { once.Do(func() { close(done) }) }, nil
 }
 
 func (c abiHostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	operationID, stop, err := c.operation(ctx)
+	if err != nil {
+		return pluginapi.HTTPResponse{}, err
+	}
+	defer stop()
 	return callHost[pluginapi.HTTPResponse](pluginabi.MethodHostHTTPDo, abiHostHTTPRequest{
 		HTTPRequest:    req,
 		HostCallbackID: c.callbackID,
+		OperationID:    operationID,
 	})
 }
 
 func (c abiHostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	operationID, stop, err := c.operation(ctx)
+	if err != nil {
+		return pluginapi.HTTPStreamResponse{}, err
+	}
 	resp, errCall := callHost[abiHostHTTPStreamResponse](pluginabi.MethodHostHTTPDoStream, abiHostHTTPRequest{
 		HTTPRequest:    req,
 		HostCallbackID: c.callbackID,
+		OperationID:    operationID,
 	})
 	if errCall != nil {
+		stop()
 		return pluginapi.HTTPStreamResponse{}, errCall
 	}
 	if resp.StreamID != "" {
 		chunks := make(chan pluginapi.HTTPStreamChunk)
-		go readHostHTTPStream(ctx, resp.StreamID, chunks)
+		go func() { defer stop(); readHostHTTPStream(ctx, resp.StreamID, chunks) }()
 		return pluginapi.HTTPStreamResponse{StatusCode: resp.StatusCode, Headers: resp.Headers, Chunks: chunks}, nil
 	}
+	stop()
 	chunks := make(chan pluginapi.HTTPStreamChunk, len(resp.Chunks))
 	for _, chunk := range resp.Chunks {
 		chunks <- chunk
@@ -481,15 +523,26 @@ func readHostHTTPStream(ctx context.Context, streamID string, out chan<- plugina
 		resp, errRead := callHost[abiHostHTTPStreamReadResponse](pluginabi.MethodHostHTTPStreamRead, abiHostHTTPStreamReadRequest{StreamID: streamID})
 		if errRead != nil {
 			closeHostHTTPStream(streamID)
-			out <- pluginapi.HTTPStreamChunk{Err: errRead}
+			select {
+			case out <- pluginapi.HTTPStreamChunk{Err: errRead}:
+			case <-ctx.Done():
+			}
 			return
 		}
 		if resp.Error != "" {
-			out <- pluginapi.HTTPStreamChunk{Err: fmt.Errorf("%s", resp.Error)}
+			select {
+			case out <- pluginapi.HTTPStreamChunk{Err: fmt.Errorf("%s", resp.Error)}:
+			case <-ctx.Done():
+			}
 			return
 		}
 		if len(resp.Payload) > 0 {
-			out <- pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), resp.Payload...)}
+			select {
+			case out <- pluginapi.HTTPStreamChunk{Payload: append([]byte(nil), resp.Payload...)}:
+			case <-ctx.Done():
+				closeHostHTTPStream(streamID)
+				return
+			}
 		}
 		if resp.Done {
 			return

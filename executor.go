@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -26,29 +25,6 @@ type Executor struct {
 	cfg        *pluginConfig
 	translator *Translator
 	keypool    *pool
-
-	// clientMu guards hostClient, the last host HTTP client seen. Management
-	// panel requests are not routed through the executor, so the account view
-	// reuses this client to keep the host's proxy policy and request log.
-	clientMu   sync.RWMutex
-	hostClient pluginapi.HostHTTPClient
-}
-
-// lastHostClient returns the most recently observed host HTTP client.
-func (e *Executor) lastHostClient() pluginapi.HostHTTPClient {
-	e.clientMu.RLock()
-	defer e.clientMu.RUnlock()
-	return e.hostClient
-}
-
-// rememberHostClient stores the host client for later management calls.
-func (e *Executor) rememberHostClient(client pluginapi.HostHTTPClient) {
-	if client == nil {
-		return
-	}
-	e.clientMu.Lock()
-	e.hostClient = client
-	e.clientMu.Unlock()
 }
 
 func NewExecutor(cfg *pluginConfig, t *Translator) *Executor {
@@ -183,7 +159,6 @@ func upstreamHeaders(apiKey string, stream bool) http.Header {
 // The CLI route streams only, so a CLI-transport request is served by draining
 // that stream and aggregating it into one chat.completion.
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-	e.rememberHostClient(req.HTTPClient)
 	members := e.cfg.members(req)
 	if len(members) == 0 {
 		return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
@@ -238,7 +213,6 @@ func (e *Executor) autoCLIFallback() bool {
 // executeCLI runs one non-streaming request through the CLI route by draining
 // the event stream and aggregating it.
 func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest, members []APIKeyEntry) (pluginapi.ExecutorResponse, error) {
-	e.rememberHostClient(req.HTTPClient)
 	model := e.upstreamModelFor(req)
 	body := e.buildCLIBody(model, req.Payload)
 	var lastErr error
@@ -281,7 +255,6 @@ func (e *Executor) executeCLI(ctx context.Context, req pluginapi.ExecutorRequest
 
 // ExecuteStream performs a streaming chat completion. Normalized chunks stay
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
-	e.rememberHostClient(req.HTTPClient)
 	framing := streamFramingForRequest(req)
 	members := e.cfg.members(req)
 	if len(members) == 0 {
@@ -329,7 +302,6 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 // executeCLIStream runs one streaming request through the CLI route. Failover
 // applies before the first upstream byte only, matching the provider path.
 func (e *Executor) executeCLIStream(ctx context.Context, req pluginapi.ExecutorRequest, members []APIKeyEntry, framing streamFramingPolicy) (pluginapi.ExecutorStreamResponse, error) {
-	e.rememberHostClient(req.HTTPClient)
 	model := e.upstreamModelFor(req)
 	body := e.buildCLIBody(model, req.Payload)
 	var lastErr error
