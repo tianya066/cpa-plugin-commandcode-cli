@@ -199,19 +199,22 @@ page reload does not hammer the account endpoints.
 `base_url` and `priority` are declared as `ConfigField`s, so the panel can render them.
 The CLI route still needs a restart after a config change (the host does not hot-reload
 plugin configuration).
+
 ### Panel authentication
 
-The panel page is served from the plugin resource route (no auth on the document
-itself), while its data comes from `/v0/management/commandcode/status`, which the
-host protects with the management key. The page therefore reads the key the CPA
-panel itself stored:
+The page document is served from the plugin resource route (unauthenticated),
+while its data comes from `/v0/management/commandcode/status`, which the host
+protects with the management key. The page resolves the key in this order:
 
-* `localStorage["managementKey"]`, which the panel writes XOR-obfuscated with
-  `"cli-proxy-api-webui::secure-storage|<host>|<userAgent>"` and prefixed with
-  `enc::v1::` (the page de-obfuscates the same way the panel does);
-* a plaintext value, if the entry was written by an older panel or by hand;
-* `?key=<management key>` on the page URL, as a fallback.
+1. **its own entry** `localStorage["commandcode-management-key"]` — paste the CPA
+   management key into the box at the top of the page once and press 保存; this is
+   the reliable path and the same approach the clinepass plugin page uses;
+2. `localStorage["managementKey"]`, which the panel writes only when you tick
+   **记住密码** at login (XOR-obfuscated with
+   `"cli-proxy-api-webui::secure-storage|<host>|<userAgent>"`, `enc::v1::` prefix —
+   the page de-obfuscates it exactly like the panel store does);
+3. `localStorage["cli-proxy-auth"]` (the panel's zustand blob), if it ever carries
+   `state.managementKey`;
+4. `?key=<management key>` on the page URL.
 
-So the page works as soon as you have signed in to the panel **in the same browser**
-(same origin ⇒ same localStorage). If it reports `HTTP 401`, sign in to the panel
-first, or append `?key=…` once.
+If the page reports `HTTP 401`, paste the key into the box and press 保存 once.
