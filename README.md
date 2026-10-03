@@ -160,12 +160,13 @@ Mirrors the reference implementation
 | `x-project-slug` | slug of `cli_working_dir` | project identifier |
 | `x-taste-learning` | `false` | CLI feature flag |
 | `x-co-flag` | `false` | CLI feature flag |
-| `User-Agent` | `cli-proxy-commandcode/<ver> (+repo)` | truthful self-identification of the calling application |
+| `User-Agent` | `cli-proxy-commandcode/<ver>` | identifies the calling client |
 
-The `User-Agent` is deliberately **not** a copy of the official CLI's: the reference
-implementation sends its own product identity (`<product>/<version> (+url)`) rather than
-impersonating the vendor's client, and this fork follows that policy. Override it with
-`cli_user_agent:` if your deployment needs a different identity.
+The `User-Agent` is deliberately **not** a copy of the official CLI's, and it carries
+**no repository or provenance URL**. The UA reaches a third-party service on every
+request, so embedding the operator's fork URL would leak which fork a deployment runs
+for no functional gain — the route gates on `x-command-code-version`, not on the UA.
+Override it with `cli_user_agent:` if your deployment needs a different identity.
 
 `projectSlug` follows the reference implementation's `projectSlugFromPath`: lower-cased,
 non-alphanumerics collapsed to single dashes, drive prefix dropped, edges trimmed.
@@ -247,3 +248,13 @@ operator to the management credential input.
 
 `cmd/commandcode/abi_contract_test.go` 覆盖这三项契约：状态码按 SDK 类型往返、
 注册上报 schema_version ≥ 6、已实现能力必须在线上导出且有分发分支。
+
+### User-Agent 不再包含仓库地址（0.7.3）
+
+CLI 通道的默认 `User-Agent` 曾写成 `cli-proxy-commandcode/<ver> (+https://github.com/<owner>/<repo>)`。
+这个请求头在每条请求上都会发给 CommandCode，等于把「本部署用的是哪个 fork、仓库在哪」
+一并上报，而 CLI 路由实际只校验 `x-command-code-version`，UA 带 URL 没有任何功能收益。
+
+现在默认值是不含 URL 的 `cli-proxy-commandcode/<version>`。`cli_local_test.go` 增加了断言：
+UA 必须标识客户端，且**不得**出现 `http`、`github.com` 或括号包裹的来源说明。
+需要不同标识时用 `cli_user_agent:` 覆盖。

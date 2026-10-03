@@ -159,8 +159,14 @@ func TestCLIHeadersMatchReferenceSet(t *testing.T) {
 			t.Fatalf("header %s = %q, want %q", k, got, v)
 		}
 	}
-	if ua := h.Get("User-Agent"); !strings.Contains(ua, "cli-proxy-commandcode/") || !strings.Contains(ua, "(+http") {
-		t.Fatalf("User-Agent must be a truthful product/version (+url) identity, got %q", ua)
+	ua := h.Get("User-Agent")
+	if !strings.Contains(ua, "cli-proxy-commandcode/") {
+		t.Fatalf("User-Agent must identify the calling client, got %q", ua)
+	}
+	// The UA reaches a third-party service on every request; it must not carry
+	// the operator's repository or any other provenance URL.
+	if strings.Contains(ua, "http") || strings.Contains(ua, "github.com") || strings.Contains(ua, "(") {
+		t.Fatalf("User-Agent must not leak a repository URL, got %q", ua)
 	}
 }
 

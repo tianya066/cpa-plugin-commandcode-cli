@@ -48,9 +48,10 @@ type pluginConfig struct {
 	CLIVersion string `yaml:"cli_version"`
 	// CLIWorkingDir fills the CLI envelope's config.workingDir (default /tmp).
 	CLIWorkingDir string `yaml:"cli_working_dir"`
-	// CLIUserAgent overrides the User-Agent sent on the CLI route. Defaults to a
-	// truthful self-identification of this plugin, matching the reference
-	// implementation's policy of always identifying the calling application.
+	// CLIUserAgent overrides the User-Agent sent on the CLI route. The default is
+	// a bare product/version token with no repository URL: the UA reaches a
+	// third-party service on every request, so it must not leak the operator's
+	// fork or deployment provenance.
 	CLIUserAgent string `yaml:"cli_user_agent"`
 
 	// Derived from Models at parse time (see buildIndexes). Not YAML fields.

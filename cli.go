@@ -172,17 +172,18 @@ func (e *Executor) cliHeaders(apiKey string) http.Header {
 	return h
 }
 
-// cliUserAgent is the identity this plugin sends upstream. It is a truthful
-// self-identification ("product/version (+url)"), not a copy of the official
-// CLI's user agent: the CLI route gates on x-command-code-version, while the UA
-// tells the service which client is actually calling.
+// cliUserAgent is the identity this plugin sends upstream. It is a plain
+// product/version token and deliberately carries no repository URL: the UA
+// reaches a third-party service on every request, so embedding the operator's
+// fork URL would leak deployment provenance for no functional gain. The CLI
+// route gates on x-command-code-version, not on the UA.
 func (c *pluginConfig) cliUserAgent() string {
 	if c != nil {
 		if ua := strings.TrimSpace(c.CLIUserAgent); ua != "" {
 			return ua
 		}
 	}
-	return "cli-proxy-commandcode/" + pluginVersion + " (+https://github.com/tianya066/cpa-plugin-commandcode-cli)"
+	return "cli-proxy-commandcode/" + pluginVersion
 }
 
 // projectSlug renders a working directory the way the reference implementation
