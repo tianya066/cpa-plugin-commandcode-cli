@@ -73,14 +73,19 @@ type cliToolCall struct {
 	Arguments string
 }
 
+// openAIUsagePromptDetails carries the cache buckets the host reads into
+// Anthropic's cache_read_input_tokens / cache_creation_input_tokens.
+type openAIUsagePromptDetails struct {
+	CachedTokens     int64 `json:"cached_tokens,omitempty"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+}
+
 // openAIUsage is the usage block emitted on the wire.
 type openAIUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
-	PromptDetails    *struct {
-		CachedTokens int64 `json:"cached_tokens"`
-	} `json:"prompt_tokens_details,omitempty"`
+	PromptTokens      int64                     `json:"prompt_tokens"`
+	CompletionTokens  int64                     `json:"completion_tokens"`
+	TotalTokens       int64                     `json:"total_tokens"`
+	PromptDetails     *openAIUsagePromptDetails `json:"prompt_tokens_details,omitempty"`
 	CompletionDetails *struct {
 		ReasoningTokens int64 `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details,omitempty"`
@@ -237,17 +242,33 @@ func (e *Executor) buildCLIBody(model string, payload []byte) []byte {
 	}
 
 	msgs, system := cliMessages(src["messages"])
+	tools := cliTools(src["tools"])
 	params := map[string]any{
-		"model":       model,
-		"messages":    msgs,
-		"tools":       cliTools(src["tools"]),
-		"system":      system,
-		"max_tokens":  cliMaxTokens(src),
-		"temperature": cliFloat(src["temperature"], 0.3),
-		"stream":      true,
+		"model":      model,
+		"messages":   msgs,
+		"tools":      tools,
+		"system":     system,
+		"max_tokens": cliMaxTokens(src),
+		"stream":     true,
+	}
+	// temperature is forwarded only when the client set it: the official CLI
+	// omits the key entirely rather than sending a default.
+	if t := src["temperature"]; cliNumeric(t) {
+		params["temperature"] = cliFloat(t, 0)
 	}
 	if effort := strings.TrimSpace(gjsonGetString(payload, "reasoning_effort")); effort != "" && effort != "none" && effort != "auto" {
 		params["reasoning_effort"] = effort
+	}
+	// tool_choice is a validated object on this route: {type:"auto"|"any"|"tool",
+	// name?}. OpenAI "none" has no counterpart (the union rejects "none"), so it
+	// is emulated by sending an empty tools list. Note: live probing shows the
+	// route accepts a forcing choice ("any"/"tool") but does not enforce it (the
+	// official CLI never sends one); it is mapped so the request stays valid and
+	// takes effect if the route starts honoring it. Only "none" is guaranteed.
+	if tc, stripTools := cliToolChoice(src["tool_choice"], src["parallel_tool_calls"]); stripTools {
+		params["tools"] = []any{}
+	} else if tc != nil {
+		params["tool_choice"] = tc
 	}
 
 	body := map[string]any{
@@ -339,7 +360,18 @@ func cliMessages(raw any) ([]any, any) {
 	}}
 }
 
-// cliContentBlocks keeps the OpenAI content shape (string or block array).
+// cliContentBlocks converts OpenAI content parts into the route's accepted
+// shapes. Live probing of /alpha/generate shows the message-part union accepts
+// the AI SDK and Anthropic forms only: text, image{image,mimeType},
+// image{source}, document{source}, reasoning, thinking, tool-call/-result,
+// tool_result/tool_use, search_result, web_*_tool_result, server_tool_use.
+// OpenAI's image_url/file/input_audio are NOT in the union, and anything that
+// fails validation returns 400 for the whole request — so every part is either
+// converted or replaced by a visible placeholder; nothing passes through raw.
+// The document{source} variant passes zod but the downstream ModelMessage
+// conversion rejects it (the route cannot actually carry documents — the
+// official CLI downgrades binary attachments to text notes too), so files,
+// documents, and audio all become explicit markers here as well.
 func cliContentBlocks(raw any) any {
 	if text, ok := raw.(string); ok {
 		return text
@@ -353,12 +385,29 @@ func cliContentBlocks(raw any) any {
 			}
 			kind, _ := block["type"].(string)
 			switch kind {
-			case "text":
+			case "text", "input_text", "output_text":
 				out = append(out, map[string]any{"type": "text", "text": cliTextContent(block["text"])})
-			case "image_url", "image":
-				out = append(out, block)
+			case "image_url", "input_image", "image":
+				if part := cliImagePart(block); part != nil {
+					out = append(out, part)
+				} else {
+					out = append(out, cliOmittedPart(kind))
+				}
+			case "file", "document", "container_upload", "input_audio":
+				out = append(out, cliBinaryMarker(block, kind))
+			case "thinking":
+				// Claude thinking blocks arriving inside content arrays become
+				// reasoning parts, matching the official CLI's assistant turn.
+				if t := cliTextContent(block["thinking"]); strings.TrimSpace(t) != "" {
+					out = append(out, map[string]any{"type": "reasoning", "text": t})
+				}
+			case "reasoning":
+				// Already a route-native part; keep only the fields it validates.
+				if t := cliTextContent(block["text"]); strings.TrimSpace(t) != "" {
+					out = append(out, map[string]any{"type": "reasoning", "text": t})
+				}
 			default:
-				out = append(out, block)
+				out = append(out, cliOmittedPart(kind))
 			}
 		}
 		if len(out) > 0 {
@@ -366,6 +415,312 @@ func cliContentBlocks(raw any) any {
 		}
 	}
 	return ""
+}
+
+// cliOmittedPart renders a text marker for content the route cannot carry, so
+// the model sees that something was dropped instead of silently imagining it.
+func cliOmittedPart(kind string) map[string]any {
+	if kind == "" {
+		kind = "unknown"
+	}
+	return map[string]any{"type": "text", "text": "[omitted unsupported " + kind + " content]"}
+}
+
+// parseDataURL splits a data: URL into media type and base64 payload. Only
+// base64-encoded URLs are usable upstream; percent-encoded ones return ok=false.
+func parseDataURL(raw string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(raw, "data:") {
+		return "", "", false
+	}
+	rest := raw[len("data:"):]
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		return "", "", false
+	}
+	meta, payload := rest[:comma], rest[comma+1:]
+	fields := strings.Split(meta, ";")
+	isBase64 := false
+	for _, f := range fields[1:] {
+		if strings.EqualFold(strings.TrimSpace(f), "base64") {
+			isBase64 = true
+		}
+	}
+	if !isBase64 || payload == "" {
+		return "", "", false
+	}
+	mediaType = strings.TrimSpace(fields[0])
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	return mediaType, payload, true
+}
+
+// cliImagePart converts any inbound image spelling to the official wire shape
+// {type:"image", image:"data:<mime>;base64,<b64>"|<url>, mimeType}. The route
+// accepts both the data-URL string and a remote http(s) URL in `image`.
+func cliImagePart(block map[string]any) map[string]any {
+	kind, _ := block["type"].(string)
+	switch kind {
+	case "image_url", "input_image":
+		// image_url arrives as {url:...} (chat completions / claude translation)
+		// or as a bare string (responses input_image).
+		var url string
+		switch v := block["image_url"].(type) {
+		case string:
+			url = v
+		case map[string]any:
+			url, _ = v["url"].(string)
+		}
+		return cliImageFromURL(url)
+	case "image":
+		if src, ok := block["source"].(map[string]any); ok {
+			switch src["type"] {
+			case "base64":
+				data, _ := src["data"].(string)
+				if data == "" {
+					return nil
+				}
+				mt, _ := src["media_type"].(string)
+				if mt == "" {
+					mt = "application/octet-stream"
+				}
+				return map[string]any{"type": "image", "image": "data:" + mt + ";base64," + data, "mimeType": mt}
+			case "url":
+				url, _ := src["url"].(string)
+				return cliImageFromURL(url)
+			}
+			return nil
+		}
+		// Already AI-SDK-shaped ({type:image, image:...}) — normalize fields.
+		if img, ok := block["image"].(string); ok && img != "" {
+			out := map[string]any{"type": "image", "image": img}
+			for _, k := range []string{"mimeType", "mediaType", "media_type"} {
+				if mt, ok := block[k].(string); ok && mt != "" {
+					out["mimeType"] = mt
+					break
+				}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+func cliImageFromURL(url string) map[string]any {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return nil
+	}
+	if mt, _, ok := parseDataURL(url); ok {
+		return map[string]any{"type": "image", "image": url, "mimeType": mt}
+	}
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return map[string]any{"type": "image", "image": url}
+	}
+	return nil
+}
+
+// cliBinaryMarker renders a file/document/audio part as an informative text
+// marker. The route advertises a document{source} union variant but rejects it
+// in the downstream ModelMessage conversion, so binary attachments cannot be
+// delivered at all — the official CLI emits an equivalent "binary content
+// omitted" note instead of attaching bytes.
+func cliBinaryMarker(block map[string]any, kind string) map[string]any {
+	var name, mediaType string
+	var size int
+	switch kind {
+	case "file":
+		file, _ := block["file"].(map[string]any)
+		name, _ = file["filename"].(string)
+		if name == "" {
+			name, _ = block["filename"].(string)
+		}
+		if fd, _ := file["file_data"].(string); fd != "" {
+			if mt, data, ok := parseDataURL(fd); ok {
+				mediaType, size = mt, base64Len(data)
+			} else {
+				size = len(fd)
+			}
+		}
+	case "input_audio":
+		kind = "audio"
+		if a, _ := block["input_audio"].(map[string]any); a != nil {
+			if f, _ := a["format"].(string); f != "" {
+				mediaType = "audio/" + f
+			}
+			if d, _ := a["data"].(string); d != "" {
+				size = base64Len(d)
+			}
+		}
+	default: // document, container_upload, and future binary kinds
+		if src, _ := block["source"].(map[string]any); src != nil {
+			mediaType, _ = src["media_type"].(string)
+			if d, _ := src["data"].(string); d != "" {
+				size = base64Len(d)
+			}
+		}
+		name, _ = block["title"].(string)
+	}
+	if kind == "" {
+		kind = "binary"
+	}
+	var b strings.Builder
+	b.WriteString("[omitted ")
+	b.WriteString(kind)
+	b.WriteString(" content")
+	if name != "" {
+		b.WriteString(" \"")
+		b.WriteString(name)
+		b.WriteString("\"")
+	}
+	if mediaType != "" || size > 0 {
+		b.WriteString(" (")
+		b.WriteString(mediaType)
+		if mediaType != "" && size > 0 {
+			b.WriteString(", ")
+		}
+		if size > 0 {
+			fmt.Fprintf(&b, "%d bytes", size)
+		}
+		b.WriteString(")")
+	}
+	b.WriteString(" — only text and image attachments are supported]")
+	return map[string]any{"type": "text", "text": b.String()}
+}
+
+// base64Len estimates the decoded byte count of a base64 payload for display.
+func base64Len(data string) int {
+	n := len(data)
+	switch {
+	case strings.HasSuffix(data, "=="):
+		n -= 2
+	case strings.HasSuffix(data, "="):
+		n--
+	}
+	return n * 3 / 4
+}
+
+// cliMediaPart renders an inbound image part as a tool-result media part
+// ({type:"media", data:<raw base64>, mediaType}) — the shape the official CLI
+// puts inside output:{type:"content", value:[...]}. Remote URLs have no media
+// form, so they return nil and the caller emits a text marker instead.
+func cliMediaPart(block map[string]any) map[string]any {
+	kind, _ := block["type"].(string)
+	switch kind {
+	case "image_url", "input_image":
+		var url string
+		switch v := block["image_url"].(type) {
+		case string:
+			url = v
+		case map[string]any:
+			url, _ = v["url"].(string)
+		}
+		mt, data, ok := parseDataURL(url)
+		if !ok {
+			return nil
+		}
+		return map[string]any{"type": "media", "data": data, "mediaType": mt}
+	case "image":
+		if src, ok := block["source"].(map[string]any); ok {
+			if src["type"] == "base64" {
+				data, _ := src["data"].(string)
+				if data == "" {
+					return nil
+				}
+				mt, _ := src["media_type"].(string)
+				if mt == "" {
+					mt = "application/octet-stream"
+				}
+				return map[string]any{"type": "media", "data": data, "mediaType": mt}
+			}
+			return nil
+		}
+		if img, ok := block["image"].(string); ok && img != "" {
+			mt, data, ok := parseDataURL(img)
+			if !ok {
+				return nil
+			}
+			out := map[string]any{"type": "media", "data": data, "mediaType": mt}
+			for _, k := range []string{"mimeType", "mediaType", "media_type"} {
+				if m, ok := block[k].(string); ok && m != "" {
+					out["mediaType"] = m
+					break
+				}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// cliToolChoice maps OpenAI tool_choice (+ parallel_tool_calls) onto the route's
+// Anthropic-flavored object. The route rejects the OpenAI spellings outright
+// ("auto" as a string, {"type":"function",...}) and has no "none" member, so:
+//
+//	"auto"/{"type":"auto"}                  -> {type:"auto"}
+//	"required"/{"type":"any"}               -> {type:"any"}
+//	{"type":"function",function:{name}}     -> {type:"tool", name}
+//	{"type":"tool",name}                    -> passed through
+//	"none"/{"type":"none"}                  -> stripTools (emulated by tools:[])
+//
+// parallel_tool_calls:false folds into disable_parallel_tool_use; without a
+// tool_choice it still emits {type:"auto", disable_parallel_tool_use:true}.
+//
+// The route validates but does not currently enforce "any"/"tool"; "none" is
+// the only mapping with a guaranteed effect, because it removes the tools.
+func cliToolChoice(raw, parallelRaw any) (map[string]any, bool) {
+	disableParallel := false
+	if b, ok := parallelRaw.(bool); ok && !b {
+		disableParallel = true
+	}
+	var out map[string]any
+	strip := false
+	switch v := raw.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "", "auto":
+			// absent/auto: default behavior, no object needed
+		case "required":
+			out = map[string]any{"type": "any"}
+		case "none":
+			strip = true
+		}
+	case map[string]any:
+		t := strings.ToLower(stringField(v, "type"))
+		switch t {
+		case "auto", "any":
+			out = map[string]any{"type": t}
+		case "tool":
+			name := stringField(v, "name")
+			if name == "" {
+				name = stringField(v, "toolName")
+			}
+			if name != "" {
+				out = map[string]any{"type": "tool", "name": name}
+			}
+		case "function":
+			// OpenAI object form.
+			name := ""
+			if fn, ok := v["function"].(map[string]any); ok {
+				name = stringField(fn, "name")
+			}
+			if name != "" {
+				out = map[string]any{"type": "tool", "name": name}
+			}
+		case "none":
+			strip = true
+		}
+	}
+	if strip {
+		return nil, true
+	}
+	if out == nil && disableParallel {
+		out = map[string]any{"type": "auto"}
+	}
+	if out != nil && disableParallel {
+		out["disable_parallel_tool_use"] = true
+	}
+	return out, false
 }
 
 func cliTextContent(raw any) string {
@@ -435,7 +790,16 @@ func cliMaxTokens(src map[string]any) int64 {
 			}
 		}
 	}
-	return 32000
+	// The official CLI defaults max_tokens to 64000 when unset.
+	return 64000
+}
+
+func cliNumeric(raw any) bool {
+	switch raw.(type) {
+	case float64, int64, int, json.Number:
+		return true
+	}
+	return false
 }
 
 func cliFloat(raw any, def float64) float64 {
@@ -763,7 +1127,9 @@ func (s *cliStreamState) aggregate() []byte {
 }
 
 // convertCLIUsage maps the CLI's token report onto OpenAI usage fields. The
-// CLI reports disjoint input buckets (uncached + cache read + cache write).
+// CLI reports inputTokens as the grand total including the disjoint cache
+// buckets (verified live: a warm-cache request reports the same inputTokens
+// with cacheReadTokens non-zero), matching OpenAI's prompt_tokens convention.
 func convertCLIUsage(raw map[string]any) *openAIUsage {
 	usage := newOpenAIUsage()
 	usage.PromptTokens = intField(raw, "inputTokens")
@@ -772,13 +1138,21 @@ func convertCLIUsage(raw map[string]any) *openAIUsage {
 		return nil
 	}
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	// Hosts map cache_write_tokens to Anthropic's cache_creation_input_tokens.
+	// The nested details are preferred; the top-level names are read on their
+	// own so a report without inputTokenDetails still carries its cache buckets.
+	cached := intField(raw, "cacheReadTokens")
+	write := intField(raw, "cacheWriteTokens")
 	if details, ok := raw["inputTokenDetails"].(map[string]any); ok {
-		cached := intField(details, "cacheReadTokens")
-		if cached > 0 {
-			usage.PromptDetails = &struct {
-				CachedTokens int64 `json:"cached_tokens"`
-			}{CachedTokens: cached}
+		if v := intField(details, "cacheReadTokens"); v > 0 {
+			cached = v
 		}
+		if v := intField(details, "cacheWriteTokens"); v > 0 {
+			write = v
+		}
+	}
+	if cached > 0 || write > 0 {
+		usage.PromptDetails = &openAIUsagePromptDetails{CachedTokens: cached, CacheWriteTokens: write}
 	}
 	if details, ok := raw["outputTokenDetails"].(map[string]any); ok {
 		if reasoning := intField(details, "reasoningTokens"); reasoning > 0 {
@@ -823,6 +1197,8 @@ func intField(m map[string]any, key string) int64 {
 		return int64(v)
 	case int64:
 		return v
+	case int:
+		return int64(v)
 	case json.Number:
 		if n, err := v.Int64(); err == nil {
 			return n
